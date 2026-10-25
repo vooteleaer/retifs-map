@@ -2,7 +2,9 @@
 //! shared core. Every record with a place (ADR-0027): photos where they were
 //! taken, contacts where they live, events where they happen, anything else
 //! that says where it is. Contacts and events with an address but no
-//! coordinates are placed with a click. It updates as the libraries change.
+//! coordinates are placed with a click or an address search (off until the
+//! user turns it on); new places are saved as records of their own. It
+//! updates as the libraries change.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -11,7 +13,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use retifs_map_core::{Kind, Map, Place, Unplaced};
+use retifs_map_core::{Found, Kind, Map, Place, Unplaced};
 use shumate::prelude::*;
 
 fn main() -> glib::ExitCode {
@@ -71,6 +73,17 @@ struct App {
     status: gtk::Label,
     fitted: Cell<bool>,
     zoom: Cell<i32>,
+    window: adw::ApplicationWindow,
+    search: gtk::SearchEntry,
+    search_on: adw::SwitchRow,
+    results: gtk::ListBox,
+    results_pop: gtk::Popover,
+    found: RefCell<Vec<Found>>,
+    /// A spot picked but not saved: a search result or a click while adding.
+    pin_layer: shumate::MarkerLayer,
+    adding: Cell<bool>,
+    card_button: gtk::Button,
+    card_action: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 fn build(gapp: &adw::Application) {
@@ -87,16 +100,24 @@ fn build(gapp: &adw::Application) {
     }
     let unplaced_group = adw::PreferencesGroup::builder()
         .title("Not on the map yet")
-        .description("Contacts and events with an address but no place. Pick one, then click the map.")
+        .description("Contacts and events with an address but no place. Pick one, then click the map or search its address.")
         .visible(false)
         .build();
     let unplaced_row = adw::ExpanderRow::builder().build();
     unplaced_row.add_prefix(&gtk::Image::from_icon_name("find-location-symbolic"));
     unplaced_group.add(&unplaced_row);
+    let search_group = adw::PreferencesGroup::builder().title("Address search").build();
+    let search_on = adw::SwitchRow::builder()
+        .title("Search in OpenStreetMap")
+        .subtitle("Sends what you search for to OpenStreetMap's Nominatim, and nothing else")
+        .active(retifs_map_core::lookup_allowed())
+        .build();
+    search_group.add(&search_on);
     let status = gtk::Label::builder().xalign(0.0).margin_start(12).margin_bottom(8).css_classes(["dim-label", "caption"]).build();
     let side_inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(24).margin_start(12).margin_end(12).margin_top(12).margin_bottom(12).build();
     side_inner.append(&layers_group);
     side_inner.append(&unplaced_group);
+    side_inner.append(&search_group);
     let side_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     side_box.append(&gtk::ScrolledWindow::builder().child(&side_inner).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build());
     side_box.append(&status);
@@ -116,15 +137,33 @@ fn build(gapp: &adw::Application) {
     let viewport = smap.viewport().expect("a viewport");
     let layer = shumate::MarkerLayer::new(&viewport);
     smap.add_overlay_layer(&layer);
+    let pin_layer = shumate::MarkerLayer::new(&viewport);
+    smap.add_overlay_layer(&pin_layer);
+    let search = gtk::SearchEntry::builder().placeholder_text("Search an address").width_chars(36).build();
+    let results = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    results.add_css_class("boxed-list");
+    let results_pop = gtk::Popover::builder()
+        .child(&gtk::ScrolledWindow::builder().child(&results).propagate_natural_height(true).max_content_height(420).min_content_width(420).build())
+        .autohide(true)
+        .has_arrow(false)
+        .build();
+    results_pop.set_parent(&search);
+    let add = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Add a place").build();
+    let header = adw::HeaderBar::builder().title_widget(&search).build();
+    header.pack_start(&add);
     let banner = adw::Banner::builder().button_label("Cancel").revealed(false).build();
     let card = adw::ActionRow::builder().build();
     card.add_css_class("card");
+    let card_button = gtk::Button::builder().valign(gtk::Align::Center).visible(false).css_classes(["suggested-action"]).build();
+    let card_close = gtk::Button::builder().icon_name("window-close-symbolic").valign(gtk::Align::Center).css_classes(["flat", "circular"]).build();
+    card.add_suffix(&card_button);
+    card.add_suffix(&card_close);
     let card_box = gtk::Box::builder().halign(gtk::Align::Center).valign(gtk::Align::End).margin_bottom(18).width_request(360).visible(false).build();
     card_box.append(&card);
     let overlay = gtk::Overlay::builder().child(&smap).build();
     overlay.add_overlay(&card_box);
     let content = adw::ToolbarView::new();
-    content.add_top_bar(&adw::HeaderBar::new());
+    content.add_top_bar(&header);
     content.add_top_bar(&banner);
     content.set_content(Some(&overlay));
     let content_page = adw::NavigationPage::builder().title("Map").child(&content).build();
@@ -153,7 +192,54 @@ fn build(gapp: &adw::Application) {
         status,
         fitted: Cell::new(false),
         zoom: Cell::new(-1),
+        window: window.clone(),
+        search: search.clone(),
+        search_on: search_on.clone(),
+        results,
+        results_pop,
+        found: RefCell::new(Vec::new()),
+        pin_layer,
+        adding: Cell::new(false),
+        card_button: card_button.clone(),
+        card_action: RefCell::new(None),
     });
+    {
+        let me2 = me.clone();
+        card_button.connect_clicked(move |_| {
+            let action = me2.card_action.borrow().clone();
+            if let Some(f) = action {
+                f();
+            }
+        });
+    }
+    {
+        let me2 = me.clone();
+        card_close.connect_clicked(move |_| {
+            me2.card_box.set_visible(false);
+            me2.pin_layer.remove_all();
+        });
+    }
+    {
+        let me2 = me.clone();
+        search_on.connect_active_notify(move |row| {
+            if let Err(e) = retifs_map_core::allow_lookup(row.is_active()) {
+                me2.status.set_text(&format!("Not changed: {e}"));
+            }
+        });
+    }
+    {
+        let me2 = me.clone();
+        search.connect_activate(move |e| ask_search(&me2, e.text().to_string()));
+    }
+    {
+        let me2 = me.clone();
+        add.connect_clicked(move |_| {
+            *me2.placing.borrow_mut() = None;
+            me2.adding.set(true);
+            me2.banner.set_title("Click the map where the new place is, or search its address");
+            me2.banner.set_revealed(true);
+        });
+    }
     for (_, row) in me.layers.borrow().iter() {
         let me2 = me.clone();
         row.connect_active_notify(move |_| draw(&me2));
@@ -172,6 +258,7 @@ fn build(gapp: &adw::Application) {
         banner.connect_button_clicked(move |b| {
             b.set_revealed(false);
             *me2.placing.borrow_mut() = None;
+            me2.adding.set(false);
         });
     }
     // A click on the map while placing: there.
@@ -179,18 +266,19 @@ fn build(gapp: &adw::Application) {
         let me2 = me.clone();
         let click = gtk::GestureClick::new();
         click.connect_released(move |g, _, x, y| {
-            let Some(u) = me2.placing.borrow_mut().take() else { return };
+            if me2.placing.borrow().is_none() && !me2.adding.get() {
+                return;
+            }
             let Some(w) = g.widget() else { return };
             let Some(vp) = me2.smap.viewport() else { return };
             let (lat, lon) = vp.widget_coords_to_location(&w, x, y);
-            me2.banner.set_revealed(false);
-            let me3 = me2.clone();
-            bg(&me2.core, move |m| m.place(&u.ns, &u.id, &u.key, lat, lon), move |r| {
-                if let Err(e) = r {
-                    me3.status.set_text(&format!("Not placed: {e}"));
-                }
-                reload(&me3);
-            });
+            if me2.adding.replace(false) {
+                me2.banner.set_revealed(false);
+                pin(&me2, lat, lon);
+                save_dialog(&me2, "", "", lat, lon);
+            } else {
+                place_here(&me2, lat, lon);
+            }
         });
         smap.add_controller(click);
     }
@@ -257,9 +345,14 @@ fn sidebar(me: &Rc<App>) {
         row.add_prefix(&gtk::Image::from_icon_name(icon(u.kind)));
         let (me2, u2) = (me.clone(), u.clone());
         row.connect_activated(move |_| {
-            me2.banner.set_title(&format!("Click the map where {} is ({})", u2.title, u2.address));
+            me2.adding.set(false);
+            me2.banner.set_title(&format!("Click the map where {} is, or pick a search result", u2.title));
             me2.banner.set_revealed(true);
             *me2.placing.borrow_mut() = Some(u2.clone());
+            me2.search.set_text(&u2.address);
+            if retifs_map_core::lookup_allowed() {
+                search(&me2, u2.address.clone());
+            }
         });
         me.unplaced_row.add_row(&row);
         me.unplaced_rows.borrow_mut().push(row.upcast());
@@ -370,6 +463,9 @@ fn focus(me: &Rc<App>, p: &Place, here: usize) {
     let label = if p.label.is_empty() { String::new() } else { format!(" ({})", p.label) };
     let when = if p.when.is_empty() { String::new() } else { format!(" · {}", p.when.replace('T', " ")) };
     me.card.set_subtitle(&glib::markup_escape_text(&format!("{}{label} · {} · {:.5}, {:.5}{when}", kind_name(p.kind), p.ns, p.lat, p.lon)));
+    me.card_button.set_visible(false);
+    *me.card_action.borrow_mut() = None;
+    me.pin_layer.remove_all();
     me.card_box.set_visible(true);
     if let Some(map) = me.smap.map() {
         map.center_on(p.lat, p.lon);
@@ -421,6 +517,159 @@ fn load_thumbs(me: &Rc<App>, groups: &[Group]) {
             draw(&me2);
         }
     });
+}
+
+/// Writes the waiting record's place (a click or a search result) and redraws.
+fn place_here(me: &Rc<App>, lat: f64, lon: f64) {
+    let Some(u) = me.placing.borrow_mut().take() else { return };
+    me.banner.set_revealed(false);
+    me.pin_layer.remove_all();
+    me.card_box.set_visible(false);
+    let me2 = me.clone();
+    bg(&me.core, move |m| m.place(&u.ns, &u.id, &u.key, lat, lon), move |r| {
+        if let Err(e) = r {
+            me2.status.set_text(&format!("Not placed: {e}"));
+        }
+        reload(&me2);
+    });
+}
+
+/// A pin where a place is about to be saved.
+fn pin(me: &Rc<App>, lat: f64, lon: f64) {
+    me.pin_layer.remove_all();
+    let m = shumate::Marker::new();
+    m.set_location(lat, lon);
+    m.set_child(Some(&gtk::Image::builder().icon_name("mark-location-symbolic").pixel_size(32).css_classes(["accent"]).build()));
+    me.pin_layer.add_marker(&m);
+}
+
+/// Enter in the search field: asks once before anything is sent out.
+fn ask_search(me: &Rc<App>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if retifs_map_core::lookup_allowed() {
+        search(me, text);
+        return;
+    }
+    let d = adw::AlertDialog::builder()
+        .heading("Search addresses in OpenStreetMap?")
+        .body("What you search for is sent to OpenStreetMap's Nominatim service, which also sees this computer's address on the internet. Nothing else leaves this device. You can turn it off again in the sidebar.")
+        .build();
+    d.add_responses(&[("cancel", "Not now"), ("on", "Turn on")]);
+    d.set_response_appearance("on", adw::ResponseAppearance::Suggested);
+    d.set_default_response(Some("on"));
+    let me2 = me.clone();
+    d.connect_response(None, move |_, r| {
+        if r == "on" {
+            me2.search_on.set_active(true);
+            search(&me2, text.clone());
+        }
+    });
+    d.present(Some(&me.window));
+}
+
+fn search(me: &Rc<App>, text: String) {
+    me.status.set_text("Searching…");
+    let me2 = me.clone();
+    bg(&me.core, move |m| m.lookup(&text), move |r| {
+        me2.status.set_text("");
+        let found = match r {
+            Ok(f) => f,
+            Err(e) => {
+                me2.status.set_text(&format!("Search failed: {e}"));
+                return;
+            }
+        };
+        me2.results.remove_all();
+        if found.is_empty() {
+            me2.results.append(&adw::ActionRow::builder().title("Nothing found").build());
+        }
+        for (i, f) in found.iter().enumerate() {
+            let (head, rest) = f.name.split_once(", ").unwrap_or((&f.name, ""));
+            let row = adw::ActionRow::builder().title(glib::markup_escape_text(head)).subtitle(glib::markup_escape_text(rest)).activatable(true).build();
+            let me3 = me2.clone();
+            row.connect_activated(move |_| {
+                let f = me3.found.borrow().get(i).cloned();
+                if let Some(f) = f {
+                    picked(&me3, &f);
+                }
+            });
+            me2.results.append(&row);
+        }
+        *me2.found.borrow_mut() = found;
+        me2.results_pop.popup();
+    });
+}
+
+/// A search result picked: the waiting record goes there, or it may be saved.
+fn picked(me: &Rc<App>, f: &Found) {
+    me.results_pop.popdown();
+    if let (Some(map), Some(vp)) = (me.smap.map(), me.smap.viewport()) {
+        vp.set_zoom_level(16.0);
+        map.center_on(f.lat, f.lon);
+    }
+    pin(me, f.lat, f.lon);
+    let head = f.name.split(", ").next().unwrap_or(&f.name).to_string();
+    let waiting = me.placing.borrow().clone();
+    me.card.set_title(&glib::markup_escape_text(&head));
+    me.card.set_subtitle(&glib::markup_escape_text(&f.name));
+    let (lat, lon, name) = (f.lat, f.lon, f.name.clone());
+    let me2 = me.clone();
+    match waiting {
+        Some(u) => {
+            me.card_button.set_label(&format!("Place {} here", u.title));
+            *me.card_action.borrow_mut() = Some(Rc::new(move || place_here(&me2, lat, lon)));
+        }
+        None => {
+            me.card_button.set_label("Save place");
+            me.adding.set(false);
+            me.banner.set_revealed(false);
+            *me.card_action.borrow_mut() = Some(Rc::new(move || save_dialog(&me2, &head, &name, lat, lon)));
+        }
+    }
+    me.card_button.set_visible(true);
+    me.card_box.set_visible(true);
+}
+
+/// Names a new place and picks its library, then saves it as a record.
+fn save_dialog(me: &Rc<App>, name: &str, address: &str, lat: f64, lon: f64) {
+    let libs = me.libraries.borrow().clone();
+    let name_row = adw::EntryRow::builder().title("Name").text(name).build();
+    let lib_model = gtk::StringList::new(&libs.iter().map(String::as_str).collect::<Vec<_>>());
+    let lib_row = adw::ComboRow::builder().title("Library").model(&lib_model).build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&name_row);
+    group.add(&lib_row);
+    let d = adw::AlertDialog::builder().heading("Save place").body(format!("{lat:.5}, {lon:.5}")).extra_child(&group).build();
+    d.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+    d.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    d.set_default_response(Some("save"));
+    d.set_response_enabled("save", !name.trim().is_empty());
+    {
+        let d2 = d.clone();
+        name_row.connect_changed(move |e| d2.set_response_enabled("save", !e.text().trim().is_empty()));
+    }
+    let (me2, address) = (me.clone(), address.to_string());
+    d.connect_response(None, move |_, r| {
+        if r != "save" {
+            return;
+        }
+        let name = name_row.text().to_string();
+        let ns = libs.get(lib_row.selected() as usize).cloned().unwrap_or_else(|| retifs_map_core::ME.into());
+        let (me3, address) = (me2.clone(), address.clone());
+        bg(&me2.core, move |m| m.save_place(&ns, &name, lat, lon, &address), move |r| {
+            match r {
+                Ok(_) => {
+                    me3.pin_layer.remove_all();
+                    me3.card_box.set_visible(false);
+                }
+                Err(e) => me3.status.set_text(&format!("Not saved: {e}")),
+            }
+            reload(&me3);
+        });
+    });
+    d.present(Some(&me.window));
 }
 
 /// A marker's picture: the middle square of a thumbnail, small.

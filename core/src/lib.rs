@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use libretifs::{types, AttrValue, Client, RecordView, Request, Response};
 
 pub const ME: &str = "me";
+/// A place saved for its own sake (ADR-0027).
+pub const PLACE_TYPE: &str = "application/x-vnd.retifs.place";
 
 /// What a placed record is, for its marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,10 +128,55 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
     (placed, unplaced)
 }
 
+/// An address search's answer: a suggestion the user may pick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    /// The whole name Nominatim gives ("Kalda, Prangli, Viimsi vald, Harju maakond, Eesti").
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+fn found(json: &str) -> Result<Vec<Found>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    let num = |k: &str| r.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
+                    Some(Found { name: r.get("display_name")?.as_str()?.to_string(), lat: num("lat")?, lon: num("lon")? })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Whether address search is on: a file in the user's config, set once per device.
+fn lookup_flag() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+    base.join("retifs-map").join("address-search-on")
+}
+
+pub fn lookup_allowed() -> bool {
+    lookup_flag().exists()
+}
+
+pub fn allow_lookup(on: bool) -> std::io::Result<()> {
+    let f = lookup_flag();
+    if on {
+        std::fs::create_dir_all(f.parent().expect("a config dir"))?;
+        std::fs::write(f, b"Address search in OpenStreetMap's Nominatim was turned on here (ADR-0027).\n")
+    } else {
+        std::fs::remove_file(f).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+    }
+}
+
 /// The connection to `retifsd`.
 pub struct Map {
     rt: tokio::runtime::Runtime,
     store: PathBuf,
+    /// When Nominatim was last asked: at most once a second (its usage policy).
+    last_lookup: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Default for Map {
@@ -141,7 +188,49 @@ impl Default for Map {
 impl Map {
     pub fn new() -> Self {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
-        Map { rt, store: libretifs::default_store_dir() }
+        Map { rt, store: libretifs::default_store_dir(), last_lookup: std::sync::Mutex::new(None) }
+    }
+
+    /// Saves a new place in `ns`; its record ID.
+    pub fn save_place(&self, ns: &str, name: &str, lat: f64, lon: f64, address: &str) -> Result<String, String> {
+        let mut c = self.client()?;
+        let mut attrs = vec![
+            ("type".to_string(), AttrValue::Str(PLACE_TYPE.into())),
+            ("name".to_string(), AttrValue::Str(name.trim().into())),
+            ("geo".to_string(), AttrValue::List(vec![AttrValue::Float((lat * 1e6).round() / 1e6), AttrValue::Float((lon * 1e6).round() / 1e6)])),
+        ];
+        if !address.trim().is_empty() {
+            attrs.push(("address".into(), AttrValue::Str(address.trim().into())));
+        }
+        match self.call(&mut c, Request::RecordCreate { ns: ns.into(), attrs, data: None })? {
+            Response::Records { records } => records.first().map(|r| r.id.clone()).ok_or_else(|| "nothing saved".into()),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
+    /// Looks an address up in OpenStreetMap's Nominatim, if the user turned it on.
+    pub fn lookup(&self, text: &str) -> Result<Vec<Found>, String> {
+        if !lookup_allowed() {
+            return Err("address search is off".into());
+        }
+        {
+            let mut last = self.last_lookup.lock().expect("lookup lock");
+            if let Some(t) = *last {
+                let wait = std::time::Duration::from_secs(1).saturating_sub(t.elapsed());
+                std::thread::sleep(wait);
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let body = ureq::get("https://nominatim.openstreetmap.org/search")
+            .set("User-Agent", concat!("retifs-map/", env!("CARGO_PKG_VERSION"), " (a retifs demo app)"))
+            .query("q", text)
+            .query("format", "jsonv2")
+            .query("limit", "8")
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_string()
+            .map_err(|e| e.to_string())?;
+        found(&body)
     }
 
     fn client(&self) -> Result<Client, String> {
@@ -260,5 +349,14 @@ mod tests {
         assert_eq!((u[0].kind, u[0].key.as_str()), (Kind::Event, "geo"));
         let (p, _) = places_of("x", &rec(&[("geo", s("59.43, 24.75"))], 0));
         assert_eq!((p[0].lat, p[0].lon, p[0].kind), (59.43, 24.75, Kind::Other));
+        let (p, _) = places_of(ME, &rec(&[("type", s(PLACE_TYPE)), ("name", s("Suvila")), ("geo", geo(58.9, 23.5))], 0));
+        assert_eq!((p[0].title.as_str(), p[0].kind), ("Suvila", Kind::Other));
+    }
+
+    #[test]
+    fn nominatim_answers() {
+        let json = r#"[{"place_id":1,"lat":"59.6236","lon":"25.0061","display_name":"Prangli, Viimsi vald, Harju maakond, Eesti"},{"lat":"x","lon":"1","display_name":"bad"}]"#;
+        assert_eq!(found(json).unwrap(), vec![Found { name: "Prangli, Viimsi vald, Harju maakond, Eesti".into(), lat: 59.6236, lon: 25.0061 }]);
+        assert!(found("[]").unwrap().is_empty());
     }
 }
