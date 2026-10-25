@@ -1,0 +1,17 @@
+[package]
+name = "retifs-map-gtk"
+description = "retifs Map for Linux: a GTK 4 / libadwaita / libshumate front end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "retifs-map"
+path = "src/main.rs"
+
+[dependencies]
+retifs-map-core = { path = "../core" }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_4"] }
+shumate = { package = "libshumate", version = "0.7" }

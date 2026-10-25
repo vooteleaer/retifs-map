@@ -1,0 +1,11 @@
+[package]
+name = "retifs-map-core"
+description = "Places on retifs: every record with a geo (ADR-0027), whatever it is, through libretifs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libretifs = { path = "../../retifs/crates/libretifs" }
+tokio = { version = "1", features = ["rt"] }

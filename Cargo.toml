@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["core", "gtk"]
+# The GTK front end builds only where GTK 4 and libadwaita are installed (Linux).
+default-members = ["core"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
