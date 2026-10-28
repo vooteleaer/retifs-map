@@ -93,6 +93,8 @@ struct App {
     layers_group: adw::PreferencesGroup,
     layer_rows: RefCell<Vec<gtk::Widget>>,
     hidden: RefCell<HashSet<String>>,
+    /// When the base map was last drawn (for redrawing as its library changes).
+    base_drawn: Cell<std::time::Instant>,
 }
 
 fn build(gapp: &adw::Application) {
@@ -203,6 +205,7 @@ fn build(gapp: &adw::Application) {
         layers_group: layers_group.clone(),
         layer_rows: RefCell::new(Vec::new()),
         hidden: RefCell::new(HashSet::new()),
+        base_drawn: Cell::new(std::time::Instant::now()),
     });
     {
         let me2 = me.clone();
@@ -294,7 +297,16 @@ fn build(gapp: &adw::Application) {
             let libs = me2.libraries.borrow().clone();
             let me3 = me2.clone();
             bg(&me2.core, move |m| m.change_counts(&libs), move |counts| {
-                if !counts.is_empty() && counts != *me3.counts.borrow() {
+                if counts.is_empty() || counts == *me3.counts.borrow() {
+                    return;
+                }
+                let changed: HashSet<String> = counts.iter().filter(|(ns, n)| me3.counts.borrow().get(*ns) != Some(*n)).map(|(ns, _)| ns.clone()).collect();
+                refresh_base(&me3, &changed);
+                // A map library changing (tiles) has no places to reload.
+                let maps: HashSet<String> = me3.tilesets.borrow().iter().map(|t| t.ns.clone()).collect();
+                if changed.is_subset(&maps) {
+                    *me3.counts.borrow_mut() = counts;
+                } else {
                     reload(&me3);
                 }
             });
@@ -752,6 +764,30 @@ fn layers_ui(me: &Rc<App>) {
     }
 }
 
+/// A new map under the places: the map layer comes on top of the others, so
+/// the markers are put back above it.
+fn set_source(me: &Rc<App>, source: &impl IsA<shumate::MapSource>) {
+    me.smap.set_map_source(Some(source));
+    for l in [&me.layer, &me.pin_layer] {
+        me.smap.remove_overlay_layer(l);
+        me.smap.add_overlay_layer(l);
+    }
+    me.base_drawn.set(std::time::Instant::now());
+}
+
+/// Tiles that weren't there when the map was drawn (a map library still
+/// syncing, or updated) are fetched again: the map is redrawn when its
+/// library changes, at most every 30 s.
+fn refresh_base(me: &Rc<App>, changed: &HashSet<String>) {
+    let Some(id) = me.base.borrow().clone() else { return };
+    let ns = me.tilesets.borrow().iter().find(|t| t.id == id).map(|t| t.ns.clone());
+    if let Some(ns) = ns {
+        if changed.contains(&ns) && me.base_drawn.get().elapsed() > std::time::Duration::from_secs(30) {
+            set_base(me, &id);
+        }
+    }
+}
+
 /// Nothing but the land colour: places still show, there's just no map under them.
 const BLANK_STYLE: &str = r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f2efe9"}}]}"##;
 
@@ -766,7 +802,7 @@ fn set_base(me: &Rc<App>, id: &str) {
     let Some(t) = t else {
         if let Ok(blank) = shumate::VectorRenderer::new("blank", BLANK_STYLE) {
             blank.set_max_zoom_level(18);
-            me.smap.set_map_source(Some(&blank));
+            set_source(me, &blank);
         }
         return;
     };
@@ -778,7 +814,7 @@ fn set_base(me: &Rc<App>, id: &str) {
                 renderer.set_license(&t.attribution);
                 renderer.set_min_zoom_level(t.minzoom.max(0) as u32);
                 renderer.set_max_zoom_level(18);
-                me2.smap.set_map_source(Some(&renderer));
+                set_source(&me2, &renderer);
             }
             Err(e) => me2.status.set_text(&format!("The map's style: {e}")),
         },
