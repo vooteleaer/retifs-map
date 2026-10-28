@@ -74,7 +74,7 @@ pub fn open(me: &Rc<App>) {
                     let row = adw::ActionRow::builder().title(glib::markup_escape_text(&title)).subtitle(glib::markup_escape_text(&sub)).subtitle_lines(3).build();
                     row.add_prefix(&gtk::Image::from_icon_name(if l.has.iter().any(|(t, _)| t == retifs_map_core::TILESET_TYPE || t == retifs_map_core::VECTOR_TILE) { "map-symbolic" } else { "mark-location-symbolic" }));
                     match (&l.here, l.readable) {
-                        (Some(ns), _) => row.add_suffix(&gtk::Label::builder().label(format!("Added as {ns}")).css_classes(["dim-label"]).build()),
+                        (Some(ns), _) => row.add_suffix(&gtk::Label::builder().label("Already joined").tooltip_text(format!("Here as {ns}")).css_classes(["dim-label"]).build()),
                         (None, false) => {}
                         (None, true) => {
                             let join = gtk::Button::builder().label("Join").valign(gtk::Align::Center).css_classes(["suggested-action"]).build();
@@ -85,7 +85,8 @@ pub fn open(me: &Rc<App>) {
                                 let (me4, b2, l3) = (me3.clone(), b.clone(), l2.clone());
                                 bg(&me3.core, move |m| m.join_heard(&l3), move |r| match r {
                                     Ok(ns) => {
-                                        b2.set_label(&format!("Added as {ns}"));
+                                        b2.set_label("Already joined");
+                                        b2.set_tooltip_text(Some(&format!("Here as {ns}")));
                                         reload(&me4);
                                     }
                                     Err(e) => {
