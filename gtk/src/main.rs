@@ -487,17 +487,29 @@ const SPACING: f64 = 30.0;
 const NAMES_FROM: f64 = 16.0;
 
 /// The places to show, most important (lowest minzoom) first, leaving out any
-/// that would crowd one already in.
+/// that would crowd one already in: its dot, and its name when names show.
 fn declutter(mut places: Vec<Place>, z: f64) -> Vec<Place> {
     places.sort_by(|a, b| a.minzoom.cmp(&b.minzoom).then(a.title.cmp(&b.title)));
-    let mut taken: HashMap<(i64, i64), Vec<(f64, f64)>> = HashMap::new();
+    const CELLS: f64 = 64.0;
+    // Each one's box: the dot (and a little room), and the label to its right.
+    let boxed = |p: &Place| {
+        let (x, y) = pixel(p.lat, p.lon, z);
+        let w = if z >= NAMES_FROM { p.title.chars().count() as f64 * 6.5 + 12.0 } else { 0.0 };
+        (x - SPACING / 2.0, y - SPACING / 2.0, x + SPACING / 2.0 + w, y + SPACING / 2.0)
+    };
+    let mut taken: HashMap<(i64, i64), Vec<(f64, f64, f64, f64)>> = HashMap::new();
     let mut out = Vec::new();
     for p in places {
-        let (x, y) = pixel(p.lat, p.lon, z);
-        let (cx, cy) = ((x / SPACING).floor() as i64, (y / SPACING).floor() as i64);
-        let crowded = (-1..=1).any(|dx| (-1..=1).any(|dy| taken.get(&(cx + dx, cy + dy)).is_some_and(|v| v.iter().any(|(ox, oy)| (ox - x).hypot(oy - y) < SPACING))));
+        let b = boxed(&p);
+        let cells = |b: (f64, f64, f64, f64)| {
+            let (x0, y0, x1, y1) = ((b.0 / CELLS).floor() as i64, (b.1 / CELLS).floor() as i64, (b.2 / CELLS).floor() as i64, (b.3 / CELLS).floor() as i64);
+            (x0..=x1).flat_map(move |x| (y0..=y1).map(move |y| (x, y)))
+        };
+        let crowded = cells(b).any(|c| taken.get(&c).is_some_and(|v| v.iter().any(|o| b.0 < o.2 && o.0 < b.2 && b.1 < o.3 && o.1 < b.3)));
         if !crowded {
-            taken.entry((cx, cy)).or_default().push((x, y));
+            for c in cells(b) {
+                taken.entry(c).or_default().push(b);
+            }
             out.push(p);
         }
     }
