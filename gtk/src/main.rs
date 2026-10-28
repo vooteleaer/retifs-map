@@ -100,6 +100,8 @@ struct App {
     hidden: RefCell<HashSet<String>>,
     /// Libraries joined from elsewhere (not made here): these can be left.
     joined: RefCell<Vec<String>>,
+    /// The user switched the map off themselves: don't pick one for them.
+    no_map_chosen: Cell<bool>,
     /// When the base map was last drawn (for redrawing as its library changes).
     base_drawn: Cell<std::time::Instant>,
     draw_pending: Cell<bool>,
@@ -228,6 +230,7 @@ fn build(gapp: &adw::Application) {
         hidden: RefCell::new(HashSet::new()),
         joined: RefCell::new(Vec::new()),
         base_drawn: Cell::new(std::time::Instant::now()),
+        no_map_chosen: Cell::new(false),
         draw_pending: Cell::new(false),
     });
     {
@@ -854,9 +857,14 @@ fn layers_ui(me: &Rc<App>) {
         me.layers_group.remove(&r);
     }
     let maps: Vec<Tileset> = me.tilesets.borrow().iter().filter(|t| !t.overlay).cloned().collect();
-    if me.base.borrow().is_none() {
+    // No map yet (none at start, or the one shown was left): the first one
+    // that's on, as soon as there is one, unless the user turned maps off.
+    let none_shown = me.base.borrow().as_deref().is_none_or(|b| b.is_empty() || !maps.iter().any(|t| t.id == b));
+    if none_shown && !me.no_map_chosen.get() {
         let first = maps.iter().find(|t| !me.hidden.borrow().contains(&t.ns)).map(|t| t.id.clone()).unwrap_or_default();
-        set_base(me, &first);
+        if me.base.borrow().as_deref() != Some(first.as_str()) {
+            set_base(me, &first);
+        }
     }
     let places = me.places.borrow();
     // Those with a map or places, and every joined library, even before
@@ -890,6 +898,7 @@ fn layers_ui(me: &Rc<App>) {
         let (me2, maps2) = (me.clone(), maps.clone());
         row.connect_active_notify(move |r| {
             if r.is_active() {
+                me2.no_map_chosen.set(false);
                 me2.hidden.borrow_mut().remove(&ns);
                 // Its map, if it has one, becomes the one drawn.
                 if let Some(t) = maps2.iter().find(|t| t.ns == ns) {
@@ -901,6 +910,7 @@ fn layers_ui(me: &Rc<App>) {
                 if maps2.iter().any(|t| t.ns == ns && t.id == shown) {
                     // Another library's map, if one that's on has one.
                     let next = maps2.iter().find(|t| !me2.hidden.borrow().contains(&t.ns)).map(|t| t.id.clone()).unwrap_or_default();
+                    me2.no_map_chosen.set(next.is_empty());
                     set_base(&me2, &next);
                 }
             }
