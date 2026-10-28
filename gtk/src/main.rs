@@ -98,6 +98,8 @@ struct App {
     layers_group: adw::PreferencesGroup,
     layer_rows: RefCell<Vec<gtk::Widget>>,
     hidden: RefCell<HashSet<String>>,
+    /// Libraries joined from elsewhere (not made here): these can be left.
+    joined: RefCell<Vec<String>>,
     /// When the base map was last drawn (for redrawing as its library changes).
     base_drawn: Cell<std::time::Instant>,
     draw_pending: Cell<bool>,
@@ -224,6 +226,7 @@ fn build(gapp: &adw::Application) {
         layers_group: layers_group.clone(),
         layer_rows: RefCell::new(Vec::new()),
         hidden: RefCell::new(HashSet::new()),
+        joined: RefCell::new(Vec::new()),
         base_drawn: Cell::new(std::time::Instant::now()),
         draw_pending: Cell::new(false),
     });
@@ -352,8 +355,10 @@ fn reload(me: &Rc<App>) {
         let r = m.places(&libs);
         let counts = m.change_counts(&libs);
         let maps = m.tilesets(&libs);
-        (libs, r, counts, maps)
-    }, move |(libs, r, counts, maps)| {
+        let joined = m.joined(&libs);
+        (libs, r, counts, maps, joined)
+    }, move |(libs, r, counts, maps, joined)| {
+        *me2.joined.borrow_mut() = joined;
         *me2.libraries.borrow_mut() = libs;
         *me2.counts.borrow_mut() = counts;
         *me2.tilesets.borrow_mut() = maps;
@@ -854,7 +859,10 @@ fn layers_ui(me: &Rc<App>) {
         set_base(me, &first);
     }
     let places = me.places.borrow();
-    let mut libs: Vec<String> = places.iter().map(|p| p.ns.clone()).chain(maps.iter().map(|t| t.ns.clone())).collect();
+    // Those with a map or places, and every joined library, even before
+    // anything of it has arrived: joining shows at once.
+    let joined = me.joined.borrow().clone();
+    let mut libs: Vec<String> = places.iter().map(|p| p.ns.clone()).chain(maps.iter().map(|t| t.ns.clone())).chain(joined.iter().cloned()).collect();
     libs.sort();
     libs.dedup();
     if maps.is_empty() {
@@ -874,6 +882,10 @@ fn layers_ui(me: &Rc<App>) {
         if !h.is_empty() {
             what.push(h);
         }
+        if what.is_empty() && joined.contains(&ns) {
+            what.push("joined: nothing here yet, it fills in from the network".to_string());
+        }
+        let ns2 = ns.clone();
         let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&ns)).subtitle(glib::markup_escape_text(&what.join(" · "))).active(!me.hidden.borrow().contains(&ns)).build();
         let (me2, maps2) = (me.clone(), maps.clone());
         row.connect_active_notify(move |r| {
@@ -896,9 +908,41 @@ fn layers_ui(me: &Rc<App>) {
             let me3 = me2.clone();
             glib::idle_add_local_once(move || layers_ui(&me3));
         });
+        if me.joined.borrow().contains(&ns2) {
+            let leave = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Leave this library").valign(gtk::Align::Center).css_classes(["flat"]).build();
+            let (me2, ns3) = (me.clone(), ns2.clone());
+            leave.connect_clicked(move |_| leave_dialog(&me2, &ns3));
+            row.add_suffix(&leave);
+        }
         me.layers_group.add(&row);
         me.layer_rows.borrow_mut().push(row.upcast());
     }
+}
+
+/// Leaves a joined library, after asking: it's gone from this device, others
+/// keep theirs, and it can be joined again from Announces.
+fn leave_dialog(me: &Rc<App>, ns: &str) {
+    let d = adw::AlertDialog::builder()
+        .heading(format!("Leave {ns}?"))
+        .body("It's removed from this device: its places and map go, and the space it took is freed. Others keep their copies, and you can join it again from Announces.")
+        .build();
+    d.add_responses(&[("cancel", "Cancel"), ("leave", "Leave")]);
+    d.set_response_appearance("leave", adw::ResponseAppearance::Destructive);
+    let (me2, ns) = (me.clone(), ns.to_string());
+    d.connect_response(None, move |_, r| {
+        if r != "leave" {
+            return;
+        }
+        let (me3, ns2) = (me2.clone(), ns.clone());
+        bg(&me2.core, move |m| m.leave(&ns2), move |r| {
+            if let Err(e) = r {
+                me3.status.set_text(&format!("Not left: {e}"));
+            }
+            *me3.base.borrow_mut() = None;
+            reload(&me3);
+        });
+    });
+    d.present(Some(&me.window));
 }
 
 /// A new map under the places: the map layer comes on top of the others, so

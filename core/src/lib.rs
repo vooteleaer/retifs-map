@@ -414,6 +414,27 @@ impl Map {
         self.call(&mut c, Request::NsJoin { ns: name.clone(), address: l.address.clone(), from: vec![l.node.clone()], lazy: true }).map(|_| name)
     }
 
+    /// Which of `libraries` were joined (made elsewhere), not made here: those
+    /// can be left without deleting anything for anyone else.
+    pub fn joined(&self, libraries: &[String]) -> Vec<String> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        libraries
+            .iter()
+            .filter(|ns| match self.call(&mut c, Request::NsInfo { ns: (*ns).clone() }) {
+                // The address names its creator: someone else's writer key.
+                Ok(Response::Namespace(v)) => v.address.split(':').nth(2).is_some_and(|creator| creator != v.own_writer),
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Leaves a joined library on this device (others keep their copies).
+    pub fn leave(&self, ns: &str) -> Result<(), String> {
+        let mut c = self.client()?;
+        self.call(&mut c, Request::NsLeave { ns: ns.into(), mine: false }).map(|_| ())
+    }
+
     /// The maps in `libraries`.
     pub fn tilesets(&self, libraries: &[String]) -> Vec<Tileset> {
         let Ok(mut c) = self.client() else { return Vec::new() };
