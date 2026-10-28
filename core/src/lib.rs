@@ -137,6 +137,8 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
 
 /// A map in a library (ADR-0028): its tiles are records of that library.
 pub const TILESET_TYPE: &str = "application/x-vnd.retifs.tileset";
+/// A map's tiles (ADR-0028).
+pub const VECTOR_TILE: &str = "application/vnd.mapbox-vector-tile";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tileset {
@@ -201,7 +203,7 @@ pub fn absolute_style(style: &str, ns: &str) -> Result<String, String> {
 /// Whether the map shows anything of a heard library: a map, places, or
 /// records that may carry a place (photos, contacts, events).
 pub fn map_uses(l: &libretifs::HeardLibrary) -> bool {
-    l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == PLACE_TYPE || t.starts_with("image/") || types::is(t, types::PERSON) || types::is(t, types::EVENT))
+    l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == VECTOR_TILE || t == PLACE_TYPE || t.starts_with("image/") || types::is(t, types::PERSON) || types::is(t, types::EVENT))
 }
 
 /// An address search's answer: a suggestion the user may pick.
@@ -401,8 +403,14 @@ impl Map {
     /// Joins a heard library, lazily (only what's looked at is fetched),
     /// asking the node that announced it first. Its name here.
     pub fn join_heard(&self, l: &libretifs::HeardLibrary) -> Result<String, String> {
-        let name = libretifs::link::suggest_name(if l.name.trim().is_empty() { "library" } else { &l.name });
+        let base = libretifs::link::suggest_name(if l.name.trim().is_empty() { "library" } else { &l.name });
         let mut c = self.client()?;
+        // A name not taken here (another library may already have it).
+        let taken = match self.call(&mut c, Request::Namespaces)? {
+            Response::Names { names } => names,
+            _ => Vec::new(),
+        };
+        let name = std::iter::once(base.clone()).chain((2..).map(|i| format!("{base}-{i}"))).find(|n| !taken.contains(n)).expect("a free name");
         self.call(&mut c, Request::NsJoin { ns: name.clone(), address: l.address.clone(), from: vec![l.node.clone()], lazy: true }).map(|_| name)
     }
 

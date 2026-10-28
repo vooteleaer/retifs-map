@@ -15,6 +15,7 @@ fn holds(l: &HeardLibrary) -> String {
     for (t, n) in &l.has {
         let word = match t.as_str() {
             retifs_map_core::TILESET_TYPE => Some("map".to_string()),
+            retifs_map_core::VECTOR_TILE => Some(format!("{n} map tiles")),
             retifs_map_core::PLACE_TYPE => Some(format!("{n} places")),
             t if t.starts_with("image/") => Some(format!("{n} photos")),
             t if libretifs::types::is(t, libretifs::types::PERSON) => Some(format!("{n} contacts")),
@@ -71,7 +72,7 @@ pub fn open(me: &Rc<App>) {
                     };
                     let title = if l.name.is_empty() { "A public library".to_string() } else { l.name.clone() };
                     let row = adw::ActionRow::builder().title(glib::markup_escape_text(&title)).subtitle(glib::markup_escape_text(&sub)).subtitle_lines(3).build();
-                    row.add_prefix(&gtk::Image::from_icon_name(if l.has.iter().any(|(t, _)| t == retifs_map_core::TILESET_TYPE) { "map-symbolic" } else { "mark-location-symbolic" }));
+                    row.add_prefix(&gtk::Image::from_icon_name(if l.has.iter().any(|(t, _)| t == retifs_map_core::TILESET_TYPE || t == retifs_map_core::VECTOR_TILE) { "map-symbolic" } else { "mark-location-symbolic" }));
                     match (&l.here, l.readable) {
                         (Some(ns), _) => row.add_suffix(&gtk::Label::builder().label(format!("Added as {ns}")).css_classes(["dim-label"]).build()),
                         (None, false) => {}
