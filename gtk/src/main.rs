@@ -132,7 +132,8 @@ fn build(gapp: &adw::Application) {
     let unplaced_row = adw::ExpanderRow::builder().build();
     unplaced_row.add_prefix(&gtk::Image::from_icon_name("find-location-symbolic"));
     unplaced_group.add(&unplaced_row);
-    let status = gtk::Label::builder().xalign(0.0).margin_start(12).margin_bottom(8).css_classes(["dim-label", "caption"]).build();
+    // Wrapped and narrow: a long message mustn't widen the sidebar.
+    let status = gtk::Label::builder().xalign(0.0).margin_start(12).margin_end(12).margin_bottom(8).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).max_width_chars(36).css_classes(["dim-label", "caption"]).build();
     let side_inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(24).margin_start(12).margin_end(12).margin_top(12).margin_bottom(12).build();
     side_inner.append(&layers_group);
     side_inner.append(&unplaced_group);
@@ -190,7 +191,7 @@ fn build(gapp: &adw::Application) {
     content.set_content(Some(&overlay));
     let content_page = adw::NavigationPage::builder().title("Map").child(&content).build();
 
-    let split = adw::NavigationSplitView::builder().sidebar(&side_page).content(&content_page).build();
+    let split = adw::NavigationSplitView::builder().sidebar(&side_page).content(&content_page).min_sidebar_width(260.0).max_sidebar_width(360.0).build();
     let window = adw::ApplicationWindow::builder().application(gapp).title("Map").default_width(1100).default_height(720).content(&split).build();
 
     let me = Rc::new(App {

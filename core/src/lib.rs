@@ -253,6 +253,9 @@ pub fn allow_lookup(on: bool) -> std::io::Result<()> {
 pub struct Map {
     rt: tokio::runtime::Runtime,
     store: PathBuf,
+    /// RETIFS_VIA=<node>: every request to that own node over a Link
+    /// (ADR-0019): a thin client, nothing kept here.
+    via: Option<String>,
     /// When Nominatim was last asked: at most once a second (its usage policy).
     last_lookup: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -266,7 +269,8 @@ impl Default for Map {
 impl Map {
     pub fn new() -> Self {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
-        Map { rt, store: libretifs::default_store_dir(), last_lookup: std::sync::Mutex::new(None) }
+        let via = std::env::var("RETIFS_VIA").ok().filter(|v| !v.trim().is_empty());
+        Map { rt, store: libretifs::default_store_dir(), via, last_lookup: std::sync::Mutex::new(None) }
     }
 
     /// Saves a new place in `ns`; its record ID.
@@ -312,7 +316,7 @@ impl Map {
     }
 
     fn client(&self) -> Result<Client, String> {
-        self.rt.block_on(Client::connect(&self.store)).map_err(|e| e.to_string())
+        self.rt.block_on(Client::connect(&self.store)).map(|c| c.via(self.via.clone())).map_err(|e| e.to_string())
     }
 
     fn call(&self, c: &mut Client, req: Request) -> Result<Response, String> {
