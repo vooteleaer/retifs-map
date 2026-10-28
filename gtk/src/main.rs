@@ -832,62 +832,61 @@ fn holds(places: &[Place], ns: &str) -> String {
         .join(" · ")
 }
 
-/// The layers, all libraries: first the maps to choose the base map from
-/// (ADR-0028; the first one until the user picks another), then a switch for
-/// each library with places.
+/// The libraries, one row each, whatever they hold: a map, places, photos,
+/// contacts, any mix (a library has no kind). The switch shows or hides all
+/// of it. One map is drawn at a time: the one of the library switched on last,
+/// at first the first one.
 fn layers_ui(me: &Rc<App>) {
     for r in me.layer_rows.borrow_mut().drain(..) {
         me.layers_group.remove(&r);
     }
     let maps: Vec<Tileset> = me.tilesets.borrow().iter().filter(|t| !t.overlay).cloned().collect();
     if me.base.borrow().is_none() {
-        let first = maps.first().map(|t| t.id.clone()).unwrap_or_default();
+        let first = maps.iter().find(|t| !me.hidden.borrow().contains(&t.ns)).map(|t| t.id.clone()).unwrap_or_default();
         set_base(me, &first);
     }
-    // Switches like the other libraries; one map at a time, or none.
-    let chosen = me.base.borrow().clone().unwrap_or_default();
-    let switches: Rc<RefCell<Vec<(String, adw::SwitchRow)>>> = Rc::new(RefCell::new(Vec::new()));
-    for t in &maps {
-        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&t.ns)).subtitle(glib::markup_escape_text(&format!("map: {}", t.name))).active(t.id == chosen).build();
-        me.layers_group.add(&row);
-        me.layer_rows.borrow_mut().push(row.clone().upcast());
-        switches.borrow_mut().push((t.id.clone(), row.clone()));
-        let (me2, id, all) = (me.clone(), t.id.clone(), switches.clone());
-        row.connect_active_notify(move |r| {
-            if r.is_active() {
-                if me2.base.borrow().as_deref() != Some(id.as_str()) {
-                    set_base(&me2, &id);
-                }
-                for (other, sw) in all.borrow().iter() {
-                    if *other != id && sw.is_active() {
-                        sw.set_active(false);
-                    }
-                }
-            } else if me2.base.borrow().as_deref() == Some(id.as_str()) {
-                set_base(&me2, "");
-            }
-        });
-    }
+    let places = me.places.borrow();
+    let mut libs: Vec<String> = places.iter().map(|p| p.ns.clone()).chain(maps.iter().map(|t| t.ns.clone())).collect();
+    libs.sort();
+    libs.dedup();
     if maps.is_empty() {
-        let row = adw::ActionRow::builder().title("No map yet").subtitle("Add a map library with +").build();
+        let row = adw::ActionRow::builder().title("No map yet").subtitle("Add a library with a map with +").build();
         row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
         me.layers_group.add(&row);
         me.layer_rows.borrow_mut().push(row.upcast());
     }
-    let places = me.places.borrow();
-    let mut libs: Vec<String> = places.iter().map(|p| p.ns.clone()).collect();
-    libs.sort();
-    libs.dedup();
+    let base = me.base.borrow().clone().unwrap_or_default();
     for ns in libs {
-        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&ns)).subtitle(holds(&places, &ns)).active(!me.hidden.borrow().contains(&ns)).build();
-        let me2 = me.clone();
+        let map = maps.iter().find(|t| t.ns == ns).cloned();
+        let mut what: Vec<String> = Vec::new();
+        if let Some(t) = &map {
+            what.push(if t.id == base { format!("map: {} (shown)", t.name) } else { format!("map: {}", t.name) });
+        }
+        let h = holds(&places, &ns);
+        if !h.is_empty() {
+            what.push(h);
+        }
+        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&ns)).subtitle(glib::markup_escape_text(&what.join(" · "))).active(!me.hidden.borrow().contains(&ns)).build();
+        let (me2, maps2) = (me.clone(), maps.clone());
         row.connect_active_notify(move |r| {
             if r.is_active() {
                 me2.hidden.borrow_mut().remove(&ns);
+                // Its map, if it has one, becomes the one drawn.
+                if let Some(t) = maps2.iter().find(|t| t.ns == ns) {
+                    set_base(&me2, &t.id);
+                }
             } else {
                 me2.hidden.borrow_mut().insert(ns.clone());
+                let shown = me2.base.borrow().clone().unwrap_or_default();
+                if maps2.iter().any(|t| t.ns == ns && t.id == shown) {
+                    // Another library's map, if one that's on has one.
+                    let next = maps2.iter().find(|t| !me2.hidden.borrow().contains(&t.ns)).map(|t| t.id.clone()).unwrap_or_default();
+                    set_base(&me2, &next);
+                }
             }
             draw(&me2);
+            let me3 = me2.clone();
+            glib::idle_add_local_once(move || layers_ui(&me3));
         });
         me.layers_group.add(&row);
         me.layer_rows.borrow_mut().push(row.upcast());
