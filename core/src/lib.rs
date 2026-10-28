@@ -49,6 +49,8 @@ pub struct Place {
     pub lon: f64,
     /// When: a photo's `taken`, an event's `start`.
     pub when: String,
+    /// What it is, in a word or two: a place's category ("cafe"), else "".
+    pub detail: String,
     /// The first content block's read-cap (a photo), and its thumbnail's.
     pub thumb: Option<String>,
 }
@@ -104,11 +106,12 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
         _ => None,
     });
     let thumb = (kind == Kind::Photo).then(|| thumb_index.and_then(|i| r.blocks.get(i)).or(r.blocks.first()).cloned()).flatten();
+    let detail = text(r, "category").map(|c| c.replace('_', " ")).unwrap_or_default();
     let mut placed = Vec::new();
     for (k, v) in &r.attrs {
         let label = if k == "geo" { "" } else if let Some(l) = k.strip_prefix("geo:") { l } else { continue };
         if let Some((lat, lon)) = latlon(v) {
-            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), thumb: thumb.clone() });
+            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), detail: detail.clone(), thumb: thumb.clone() });
         }
     }
     // Addresses (contacts) and locations (events) without coordinates.

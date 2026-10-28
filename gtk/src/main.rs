@@ -95,6 +95,7 @@ struct App {
     hidden: RefCell<HashSet<String>>,
     /// When the base map was last drawn (for redrawing as its library changes).
     base_drawn: Cell<std::time::Instant>,
+    draw_pending: Cell<bool>,
 }
 
 fn build(gapp: &adw::Application) {
@@ -206,6 +207,7 @@ fn build(gapp: &adw::Application) {
         layer_rows: RefCell::new(Vec::new()),
         hidden: RefCell::new(HashSet::new()),
         base_drawn: Cell::new(std::time::Instant::now()),
+        draw_pending: Cell::new(false),
     });
     {
         let me2 = me.clone();
@@ -256,6 +258,10 @@ fn build(gapp: &adw::Application) {
                 draw(&me2);
             }
         });
+        let me2 = me.clone();
+        viewport.connect_latitude_notify(move |_| draw_soon(&me2));
+        let me2 = me.clone();
+        viewport.connect_longitude_notify(move |_| draw_soon(&me2));
     }
     {
         let me2 = me.clone();
@@ -417,12 +423,34 @@ fn draw(me: &Rc<App>) {
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
     me.zoom.set(z as i32);
-    let groups = groups(places, z);
+    // Grouped over everything (so groups don't change as the map moves), but
+    // only those on screen, and a screen around it, get a marker.
+    let mut groups = groups(places, z);
+    if let Some(vp) = me.smap.viewport() {
+        let (cx, cy) = pixel(vp.latitude(), vp.longitude(), z);
+        let (w, h) = (me.smap.width().max(800) as f64, me.smap.height().max(600) as f64);
+        groups.retain(|g| {
+            let (x, y) = pixel(g.members[0].lat, g.members[0].lon, z);
+            (x - cx).abs() < w * 1.5 && (y - cy).abs() < h * 1.5
+        });
+    }
     me.layer.remove_all();
     for g in &groups {
         me.layer.add_marker(&marker(me, g));
     }
     load_thumbs(me, &groups);
+}
+
+/// Draws again once the map has stopped moving for a moment.
+fn draw_soon(me: &Rc<App>) {
+    if me.draw_pending.replace(true) {
+        return;
+    }
+    let me2 = me.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+        me2.draw_pending.set(false);
+        draw(&me2);
+    });
 }
 
 /// A marker for a group: the newest photo's picture or the kind's icon, and how many.
@@ -476,7 +504,7 @@ fn focus(me: &Rc<App>, p: &Place, here: usize) {
     me.card.set_title(&glib::markup_escape_text(&title));
     let label = if p.label.is_empty() { String::new() } else { format!(" ({})", p.label) };
     let when = if p.when.is_empty() { String::new() } else { format!(" · {}", p.when.replace('T', " ")) };
-    me.card.set_subtitle(&glib::markup_escape_text(&format!("{}{label} · {} · {:.5}, {:.5}{when}", kind_name(p.kind), p.ns, p.lat, p.lon)));
+    me.card.set_subtitle(&glib::markup_escape_text(&format!("{}{label} · {} · {:.5}, {:.5}{when}", if p.detail.is_empty() { kind_name(p.kind) } else { p.detail.as_str() }, p.ns, p.lat, p.lon)));
     me.card_button.set_visible(false);
     *me.card_action.borrow_mut() = None;
     me.pin_layer.remove_all();
