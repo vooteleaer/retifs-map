@@ -100,6 +100,11 @@ struct App {
     hidden: RefCell<HashSet<String>>,
     /// Libraries joined from elsewhere (not made here): these can be left.
     joined: RefCell<Vec<String>>,
+    /// Libraries held lazily: their places are asked for by the cells on
+    /// screen (ADR-0031), kept per (library, cell) until they change.
+    lazy: RefCell<Vec<String>>,
+    cell_places: RefCell<HashMap<(String, String), Vec<Place>>>,
+    cells_asked: RefCell<HashSet<(String, String)>>,
     /// The user switched the map off themselves: don't pick one for them.
     no_map_chosen: Cell<bool>,
     /// When the base map was last drawn (for redrawing as its library changes).
@@ -230,6 +235,9 @@ fn build(gapp: &adw::Application) {
         layer_rows: RefCell::new(Vec::new()),
         hidden: RefCell::new(HashSet::new()),
         joined: RefCell::new(Vec::new()),
+        lazy: RefCell::new(Vec::new()),
+        cell_places: RefCell::new(HashMap::new()),
+        cells_asked: RefCell::new(HashSet::new()),
         base_drawn: Cell::new(std::time::Instant::now()),
         no_map_chosen: Cell::new(false),
         draw_pending: Cell::new(false),
@@ -356,13 +364,20 @@ fn reload(me: &Rc<App>) {
     let me2 = me.clone();
     bg(&me.core, |m| {
         let libs = m.libraries().unwrap_or_default();
-        let r = m.places(&libs);
+        // Lazily held libraries aren't asked for all their places at once.
+        let lazy = m.lazy(&libs);
+        let whole: Vec<String> = libs.iter().filter(|n| !lazy.contains(n)).cloned().collect();
+        let r = m.places(&whole);
         let counts = m.change_counts(&libs);
         let maps = m.tilesets(&libs);
         let joined = m.joined(&libs);
-        (libs, r, counts, maps, joined)
-    }, move |(libs, r, counts, maps, joined)| {
+        (libs, r, counts, maps, joined, lazy)
+    }, move |(libs, r, counts, maps, joined, lazy)| {
         *me2.joined.borrow_mut() = joined;
+        // Changed: their cells are asked for again (live).
+        *me2.lazy.borrow_mut() = lazy;
+        me2.cell_places.borrow_mut().clear();
+        me2.cells_asked.borrow_mut().clear();
         *me2.libraries.borrow_mut() = libs;
         *me2.counts.borrow_mut() = counts;
         *me2.tilesets.borrow_mut() = maps;
@@ -410,10 +425,55 @@ fn sidebar(me: &Rc<App>) {
     }
 }
 
-/// Places of the layers that are on.
+/// Places of the layers that are on: those held whole, and those of lazily
+/// held libraries fetched for the cells seen so far.
 fn visible(me: &Rc<App>) -> Vec<Place> {
     let hidden = me.hidden.borrow();
-    me.places.borrow().iter().filter(|p| !hidden.contains(&p.ns)).cloned().collect()
+    let mut out: Vec<Place> = me.places.borrow().iter().filter(|p| !hidden.contains(&p.ns)).cloned().collect();
+    for ((ns, _), places) in me.cell_places.borrow().iter() {
+        if !hidden.contains(ns) {
+            out.extend(places.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Cells this close in: a lazily held library's places are asked for from
+/// this zoom on (a cell is a zoom-12 tile).
+const CELLS_FROM: f64 = 12.0;
+
+/// Asks lazily held libraries for the places in the cells on screen that
+/// haven't been asked for yet.
+fn ask_cells(me: &Rc<App>, z: f64) {
+    if z < CELLS_FROM || me.lazy.borrow().is_empty() {
+        return;
+    }
+    let Some(vp) = me.smap.viewport() else { return };
+    let (w, h) = (me.smap.width() as f64, me.smap.height() as f64);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let (north, west) = vp.widget_coords_to_location(&me.smap, 0.0, 0.0);
+    let (south, east) = vp.widget_coords_to_location(&me.smap, w, h);
+    let cells = Map::cells(west, south, east, north);
+    for ns in me.lazy.borrow().iter().filter(|n| !me.hidden.borrow().contains(*n)) {
+        let missing: Vec<String> = cells.iter().filter(|c| !me.cells_asked.borrow().contains(&(ns.clone(), (*c).clone()))).take(16).cloned().collect();
+        if missing.is_empty() {
+            continue;
+        }
+        for c in &missing {
+            me.cells_asked.borrow_mut().insert((ns.clone(), c.clone()));
+        }
+        let (me2, ns2) = (me.clone(), ns.clone());
+        bg(&me.core, move |m| m.places_in(&ns2, &missing).map(|r| (ns2, r)), move |r| {
+            if let Ok((ns, found)) = r {
+                for (cell, places) in found {
+                    me2.cell_places.borrow_mut().insert((ns.clone(), cell), places);
+                }
+                draw(&me2);
+            }
+        });
+    }
 }
 
 /// Where a place is on the whole world's map at zoom `z`, in pixels (Web Mercator).
@@ -469,6 +529,7 @@ fn draw(me: &Rc<App>) {
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
     me.zoom.set(z as i32);
+    ask_cells(me, z);
     // Only what's on screen, and a screen around it, gets a marker.
     let on_screen: Box<dyn Fn(f64, f64) -> bool> = match me.smap.viewport() {
         Some(vp) => {

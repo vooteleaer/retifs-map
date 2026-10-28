@@ -346,6 +346,44 @@ impl Map {
     }
 
     /// Everything placed in `libraries`, and contacts and events that could be.
+    /// Which of `libraries` are held lazily (only what's needed is here):
+    /// their places are asked for by area (`places_in`), not all at once.
+    pub fn lazy(&self, libraries: &[String]) -> Vec<String> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        libraries
+            .iter()
+            .filter(|ns| matches!(self.call(&mut c, Request::NsInfo { ns: (*ns).clone() }), Ok(Response::Namespace(v)) if v.lazy))
+            .cloned()
+            .collect()
+    }
+
+    /// The places of a lazily held library in these cells (`12/x/y`, the
+    /// importer's `cell`): exact terms, which its holder's blind index answers.
+    pub fn places_in(&self, ns: &str, cells: &[String]) -> Result<Vec<(String, Vec<Place>)>, String> {
+        let mut c = self.client()?;
+        Ok(cells
+            .iter()
+            .map(|cell| {
+                let found = self.query(&mut c, ns, format!("cell={cell}"));
+                (cell.clone(), found.iter().flat_map(|r| places_of(ns, r).0).collect())
+            })
+            .collect())
+    }
+
+    /// The zoom-12 cells around a view: `cell`'s values to ask for.
+    pub fn cells(west: f64, south: f64, east: f64, north: f64) -> Vec<String> {
+        let tile = |lat: f64, lon: f64| {
+            let n = 4096.0;
+            let x = ((lon + 180.0) / 360.0 * n).floor() as i64;
+            let phi = lat.clamp(-85.05, 85.05).to_radians();
+            let y = ((1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor() as i64;
+            (x, y)
+        };
+        let (x0, y0) = tile(north, west);
+        let (x1, y1) = tile(south, east);
+        (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| format!("12/{x}/{y}"))).collect()
+    }
+
     pub fn places(&self, libraries: &[String]) -> Result<(Vec<Place>, Vec<Unplaced>), String> {
         let mut c = self.client()?;
         let mut seen: HashMap<String, RecordView> = HashMap::new();
@@ -516,6 +554,12 @@ mod tests {
         assert_eq!((p[0].lat, p[0].lon, p[0].kind), (59.43, 24.75, Kind::Other));
         let (p, _) = places_of(ME, &rec(&[("type", s(PLACE_TYPE)), ("name", s("Suvila")), ("geo", geo(58.9, 23.5))], 0));
         assert_eq!((p[0].title.as_str(), p[0].kind), ("Suvila", Kind::Other));
+    }
+
+    #[test]
+    fn cells_around_a_view() {
+        assert_eq!(Map::cells(24.744, 59.436, 24.746, 59.438), vec!["12/2329/1202".to_string()]);
+        assert_eq!(Map::cells(24.70, 59.40, 24.80, 59.45).len(), 2 * 3);
     }
 
     #[test]

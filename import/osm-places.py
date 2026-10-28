@@ -11,6 +11,7 @@ shows it, by how much it matters (as OpenStreetMap's own map does).
     retifs-map-import places places.jsonl --ns NS
 """
 import json
+import math
 import sys
 
 PLACE_TYPE = "application/x-vnd.retifs.place"
@@ -66,6 +67,20 @@ def middle(geom):
     return [sum(xs) / len(ring), sum(ys) / len(ring)]
 
 
+# The cell a place is in: its zoom-12 tile, "12/x/y". A map asks for the cells
+# on screen (exact terms, so a lazily held library answers them through its
+# holder's blind index, ADR-0019) instead of every place there is.
+CELL_ZOOM = 12
+
+
+def cell(lat, lon):
+    n = 2 ** CELL_ZOOM
+    x = int((lon + 180.0) / 360.0 * n)
+    phi = math.radians(max(min(lat, 85.05), -85.05))
+    y = int((1.0 - math.log(math.tan(phi) + 1.0 / math.cos(phi)) / math.pi) / 2.0 * n)
+    return f"{CELL_ZOOM}/{x}/{y}"
+
+
 def clean(v):
     return " ".join(str(v).split())
 
@@ -93,6 +108,7 @@ for line in sys.stdin:
         "geo": [round(lat, 6), round(lon, 6)],
         "category": clean(tags[cls]),
         "minzoom": minzoom(cls, tags[cls], tags),
+        "cell": cell(lat, lon),
         "osm:class": cls,
         "source": f"osm:{tags.get('@type', 'node')}/{tags.get('@id', '')}",
     }
