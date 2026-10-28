@@ -198,6 +198,12 @@ pub fn absolute_style(style: &str, ns: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
+/// Whether the map shows anything of a heard library: a map, places, or
+/// records that may carry a place (photos, contacts, events).
+pub fn map_uses(l: &libretifs::HeardLibrary) -> bool {
+    l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == PLACE_TYPE || t.starts_with("image/") || types::is(t, types::PERSON) || types::is(t, types::EVENT))
+}
+
 /// An address search's answer: a suggestion the user may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
@@ -381,6 +387,23 @@ impl Map {
             Request::NsJoin { ns: name.clone(), address, from: parsed.params_named("from").map(String::from).collect(), lazy: true }
         };
         self.call(&mut c, req).map(|_| name)
+    }
+
+    /// Public libraries heard announced on the network (ADR-0029), newest first.
+    pub fn heard(&self) -> Result<Vec<libretifs::HeardLibrary>, String> {
+        let mut c = self.client()?;
+        match self.call(&mut c, Request::HeardLibraries)? {
+            Response::Heard { libraries } => Ok(libraries),
+            _ => Err("unexpected answer".into()),
+        }
+    }
+
+    /// Joins a heard library, lazily (only what's looked at is fetched),
+    /// asking the node that announced it first. Its name here.
+    pub fn join_heard(&self, l: &libretifs::HeardLibrary) -> Result<String, String> {
+        let name = libretifs::link::suggest_name(if l.name.trim().is_empty() { "library" } else { &l.name });
+        let mut c = self.client()?;
+        self.call(&mut c, Request::NsJoin { ns: name.clone(), address: l.address.clone(), from: vec![l.node.clone()], lazy: true }).map(|_| name)
     }
 
     /// The maps in `libraries`.

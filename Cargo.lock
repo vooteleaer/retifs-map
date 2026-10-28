@@ -832,6 +832,7 @@ version = "0.0.1"
 dependencies = [
  "gtk4",
  "libadwaita",
+ "libretifs",
  "libshumate",
  "retifs-map-core",
 ]

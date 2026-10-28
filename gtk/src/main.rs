@@ -6,6 +6,7 @@
 //! user turns it on); new places are saved as records of their own. It
 //! updates as the libraries change.
 
+mod announces;
 mod icons;
 
 use std::cell::{Cell, RefCell};
@@ -164,6 +165,9 @@ fn build(gapp: &adw::Application) {
     let menu = gio::Menu::new();
     menu.append(Some("Search addresses online (OpenStreetMap)"), Some("win.online-search"));
     header.pack_end(&gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).tooltip_text("Menu").build());
+    // Public libraries heard on the network, as LXMF apps list announces (ADR-0029).
+    let announces = gtk::Button::builder().label("Announces").tooltip_text("Public libraries heard on the network").build();
+    header.pack_end(&announces);
 
     let banner = adw::Banner::builder().button_label("Cancel").revealed(false).build();
     let card = adw::ActionRow::builder().build();
@@ -226,6 +230,10 @@ fn build(gapp: &adw::Application) {
     {
         let me2 = me.clone();
         add_layer.connect_clicked(move |_| add_layer_dialog(&me2));
+    }
+    {
+        let me2 = me.clone();
+        announces.connect_clicked(move |_| announces::open(&me2));
     }
     {
         let me2 = me.clone();
