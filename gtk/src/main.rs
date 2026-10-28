@@ -51,6 +51,8 @@ fn kind_name(kind: Kind) -> &'static str {
 const UNPLACED_SHOWN: usize = 100;
 /// Markers closer than this (pixels) at the current zoom become one.
 const CELL: f64 = 56.0;
+/// Libraries with more places than this aren't what the first view fits.
+const FIT_MAX: usize = 1000;
 
 struct App {
     core: Arc<Map>,
@@ -419,7 +421,14 @@ fn draw(me: &Rc<App>) {
     let places = visible(me);
     if !me.fitted.get() && !places.is_empty() {
         me.fitted.set(true);
-        fit(me, &places);
+        // Around the user's own things: a library of thousands of places
+        // (a public one, all of a country's cafés) would show the whole country.
+        let mut per_lib: HashMap<&str, usize> = HashMap::new();
+        for p in &places {
+            *per_lib.entry(p.ns.as_str()).or_default() += 1;
+        }
+        let own: Vec<Place> = places.iter().filter(|p| per_lib[p.ns.as_str()] <= FIT_MAX).cloned().collect();
+        fit(me, if own.is_empty() { &places } else { &own });
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
     me.zoom.set(z as i32);

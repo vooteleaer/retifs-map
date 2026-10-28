@@ -21,6 +21,11 @@ SKIP = {"parking", "parking_space", "bench", "waste_basket", "bicycle_parking", 
 KEEP = {"opening_hours": "opening_hours", "website": "website", "contact:website": "website", "phone": "phone", "contact:phone": "phone", "wheelchair": "wheelchair", "cuisine": "cuisine", "description": "note", "wikipedia": "wikipedia"}
 
 
+# An area wider than this (degrees) isn't a place on the map but a region
+# (a bay, a national park): its middle can be anywhere.
+MAX_SPAN = 0.1
+
+
 def middle(geom):
     t = geom["type"]
     c = geom["coordinates"]
@@ -29,7 +34,10 @@ def middle(geom):
     ring = c[0] if t == "Polygon" else c[0][0] if t == "MultiPolygon" else c if t == "LineString" else None
     if not ring:
         return None
-    return [sum(p[0] for p in ring) / len(ring), sum(p[1] for p in ring) / len(ring)]
+    xs, ys = [p[0] for p in ring], [p[1] for p in ring]
+    if max(xs) - min(xs) > MAX_SPAN or max(ys) - min(ys) > MAX_SPAN:
+        return None
+    return [sum(xs) / len(ring), sum(ys) / len(ring)]
 
 
 def clean(v):
