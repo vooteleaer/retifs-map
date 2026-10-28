@@ -714,27 +714,31 @@ fn layers_ui(me: &Rc<App>) {
         me.layers_group.remove(&r);
     }
     let maps: Vec<Tileset> = me.tilesets.borrow().iter().filter(|t| !t.overlay).cloned().collect();
-    if me.base.borrow().is_none() || (!maps.is_empty() && me.base.borrow().as_deref() == Some("")) {
+    if me.base.borrow().is_none() {
         let first = maps.first().map(|t| t.id.clone()).unwrap_or_default();
         set_base(me, &first);
     }
+    // Switches like the other libraries; one map at a time, or none.
     let chosen = me.base.borrow().clone().unwrap_or_default();
-    let mut group: Option<gtk::CheckButton> = None;
+    let switches: Rc<RefCell<Vec<(String, adw::SwitchRow)>>> = Rc::new(RefCell::new(Vec::new()));
     for t in &maps {
-        let check = gtk::CheckButton::builder().active(t.id == chosen).valign(gtk::Align::Center).build();
-        if let Some(g) = &group {
-            check.set_group(Some(g));
-        } else {
-            group = Some(check.clone());
-        }
-        let row = adw::ActionRow::builder().title(glib::markup_escape_text(&t.ns)).subtitle(glib::markup_escape_text(&format!("map: {}", t.name))).activatable_widget(&check).build();
-        row.add_prefix(&check);
+        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&t.ns)).subtitle(glib::markup_escape_text(&format!("map: {}", t.name))).active(t.id == chosen).build();
         me.layers_group.add(&row);
-        me.layer_rows.borrow_mut().push(row.upcast());
-        let (me2, id) = (me.clone(), t.id.clone());
-        check.connect_toggled(move |c| {
-            if c.is_active() {
-                set_base(&me2, &id);
+        me.layer_rows.borrow_mut().push(row.clone().upcast());
+        switches.borrow_mut().push((t.id.clone(), row.clone()));
+        let (me2, id, all) = (me.clone(), t.id.clone(), switches.clone());
+        row.connect_active_notify(move |r| {
+            if r.is_active() {
+                if me2.base.borrow().as_deref() != Some(id.as_str()) {
+                    set_base(&me2, &id);
+                }
+                for (other, sw) in all.borrow().iter() {
+                    if *other != id && sw.is_active() {
+                        sw.set_active(false);
+                    }
+                }
+            } else if me2.base.borrow().as_deref() == Some(id.as_str()) {
+                set_base(&me2, "");
             }
         });
     }
