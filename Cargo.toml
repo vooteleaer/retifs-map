@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "gtk"]
+members = ["core", "gtk", "import"]
 # The GTK front end builds only where GTK 4 and libadwaita are installed (Linux).
-default-members = ["core"]
+default-members = ["core", "import"]
 
 [workspace.package]
 version = "0.0.1"

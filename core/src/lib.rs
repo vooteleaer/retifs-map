@@ -128,6 +128,69 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
     (placed, unplaced)
 }
 
+/// A map in a library (ADR-0028): its tiles are records of that library.
+pub const TILESET_TYPE: &str = "application/x-vnd.retifs.tileset";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tileset {
+    pub ns: String,
+    pub id: String,
+    pub name: String,
+    /// west, south, east, north
+    pub bounds: Option<[f64; 4]>,
+    pub minzoom: i64,
+    pub maxzoom: i64,
+    pub overlay: bool,
+    pub attribution: String,
+    /// The style (MapLibre style JSON): the record's content.
+    style: Option<String>,
+}
+
+fn tileset_of(ns: &str, r: &RecordView) -> Tileset {
+    let int = |k: &str| r.attrs.iter().find(|(key, _)| key == k).and_then(|(_, v)| if let AttrValue::Int(i) = v { Some(*i) } else { None });
+    let bounds = r.attrs.iter().find(|(k, _)| k == "bounds").and_then(|(_, v)| match v {
+        AttrValue::List(l) => {
+            let n: Vec<f64> = l.iter().filter_map(|x| if let AttrValue::Float(f) = x { Some(*f) } else { None }).collect();
+            (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
+        }
+        _ => None,
+    });
+    Tileset {
+        ns: ns.into(),
+        id: r.id.clone(),
+        name: text(r, "name").unwrap_or_else(|| ns.to_string()),
+        bounds,
+        minzoom: int("minzoom").unwrap_or(0),
+        maxzoom: int("maxzoom").unwrap_or(14),
+        overlay: r.attrs.iter().any(|(k, v)| k == "overlay" && *v == AttrValue::Bool(true)),
+        attribution: text(r, "attribution").unwrap_or_default(),
+        style: r.blocks.first().cloned(),
+    }
+}
+
+/// Where the gateway serves libraries (`http://<library>.localhost:<port>`).
+pub fn gateway() -> String {
+    std::env::var("RETIFS_GATEWAY").unwrap_or_else(|_| "localhost:8740".into())
+}
+
+/// A style's relative tile URLs made absolute: the map library on the gateway.
+pub fn absolute_style(style: &str, ns: &str) -> Result<String, String> {
+    let mut v: serde_json::Value = serde_json::from_str(style).map_err(|e| e.to_string())?;
+    let base = format!("http://{ns}.{}", gateway());
+    if let Some(sources) = v.get_mut("sources").and_then(|s| s.as_object_mut()) {
+        for src in sources.values_mut() {
+            if let Some(tiles) = src.get_mut("tiles").and_then(|t| t.as_array_mut()) {
+                for t in tiles.iter_mut() {
+                    if let Some(u) = t.as_str().filter(|u| u.starts_with('/')) {
+                        *t = serde_json::Value::String(format!("{base}{u}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(v.to_string())
+}
+
 /// An address search's answer: a suggestion the user may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
@@ -257,7 +320,8 @@ impl Map {
             Response::Names { names } => names,
             _ => Vec::new(),
         };
-        names.retain(|n| n != ME && !n.starts_with("ch-"));
+        // Followed public libraries (`ch-…`) too: maps, and places others publish.
+        names.retain(|n| n != ME);
         names.insert(0, ME.into());
         Ok(names)
     }
@@ -294,6 +358,28 @@ impl Map {
         let mut c = self.client()?;
         let geo = AttrValue::List(vec![AttrValue::Float((lat * 1e6).round() / 1e6), AttrValue::Float((lon * 1e6).round() / 1e6)]);
         self.call(&mut c, Request::RecordSet { ns: ns.into(), id: id.into(), attrs: vec![(key.into(), geo)], unset: vec![], data: None }).map(|_| ())
+    }
+
+    /// The maps in `libraries`.
+    pub fn tilesets(&self, libraries: &[String]) -> Vec<Tileset> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        let mut out = Vec::new();
+        for ns in libraries {
+            out.extend(self.query(&mut c, ns, format!("type={TILESET_TYPE}")).iter().map(|r| tileset_of(ns, r)));
+        }
+        out.sort_by(|a, b| a.overlay.cmp(&b.overlay).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    /// A map's style, its tiles' URLs pointing at the gateway.
+    pub fn style(&self, t: &Tileset) -> Result<String, String> {
+        let cap = t.style.clone().ok_or("this map has no style")?;
+        let size: u64 = cap.rsplit(':').next().and_then(|s| s.parse().ok()).ok_or("a bad read-cap")?;
+        let mut c = self.client()?;
+        match self.call(&mut c, Request::ReadRange { cap, ns: Some(t.ns.clone()), offset: 0, len: size, wait_ms: 30_000 })? {
+            Response::Range { data } => absolute_style(&String::from_utf8_lossy(&data), &t.ns),
+            _ => Err("no style".into()),
+        }
     }
 
     /// A small image of a photo (its thumbnail block), at most 2 MB.
@@ -351,6 +437,15 @@ mod tests {
         assert_eq!((p[0].lat, p[0].lon, p[0].kind), (59.43, 24.75, Kind::Other));
         let (p, _) = places_of(ME, &rec(&[("type", s(PLACE_TYPE)), ("name", s("Suvila")), ("geo", geo(58.9, 23.5))], 0));
         assert_eq!((p[0].title.as_str(), p[0].kind), ("Suvila", Kind::Other));
+    }
+
+    #[test]
+    fn maps() {
+        let r = rec(&[("type", s(TILESET_TYPE)), ("name", s("Eesti")), ("minzoom", AttrValue::Int(0)), ("maxzoom", AttrValue::Int(14)), ("bounds", AttrValue::List(vec![AttrValue::Float(20.8), AttrValue::Float(57.5), AttrValue::Float(28.2), AttrValue::Float(60.0)]))], 1);
+        let t = tileset_of("ch-ee", &r);
+        assert_eq!((t.name.as_str(), t.bounds, t.overlay, t.style.as_deref()), ("Eesti", Some([20.8, 57.5, 28.2, 60.0]), false, Some("cap0")));
+        let style = absolute_style(r#"{"sources":{"o":{"type":"vector","tiles":["/tiles/{z}/{x}/{y}.pbf","https://x/{z}"]}}}"#, "kaart").unwrap();
+        assert!(style.contains(r#""http://kaart.localhost:8740/tiles/{z}/{x}/{y}.pbf""#) && style.contains("https://x/{z}"), "{style}");
     }
 
     #[test]

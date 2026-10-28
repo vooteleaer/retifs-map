@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use retifs_map_core::{Found, Kind, Map, Place, Unplaced};
+use retifs_map_core::{Found, Kind, Map, Place, Tileset, Unplaced};
 use shumate::prelude::*;
 
 fn main() -> glib::ExitCode {
@@ -75,7 +75,8 @@ struct App {
     zoom: Cell<i32>,
     window: adw::ApplicationWindow,
     search: gtk::SearchEntry,
-    search_on: adw::SwitchRow,
+    /// "Search addresses online" in the main menu: off until the user agrees.
+    search_on: gio::SimpleAction,
     results: gtk::ListBox,
     results_pop: gtk::Popover,
     found: RefCell<Vec<Found>>,
@@ -84,13 +85,19 @@ struct App {
     adding: Cell<bool>,
     card_button: gtk::Button,
     card_action: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The maps in the libraries (ADR-0028), and which one is the base: a
+    /// tileset's record ID, or "" for OpenStreetMap's servers (the fallback).
+    tilesets: RefCell<Vec<Tileset>>,
+    base: RefCell<Option<String>>,
+    layers_group: adw::PreferencesGroup,
+    map_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
 fn build(gapp: &adw::Application) {
     let core = Arc::new(Map::new());
 
     // Sidebar: the layers, and what could still be placed.
-    let layers_group = adw::PreferencesGroup::builder().title("Layers").build();
+    let layers_group = adw::PreferencesGroup::builder().title("Layers").description("The map underneath comes from a public library you've joined, or from OpenStreetMap over the internet.").build();
     let mut layers = Vec::new();
     for (kind, name, icon_name) in KINDS {
         let row = adw::SwitchRow::builder().title(name).active(true).build();
@@ -106,18 +113,10 @@ fn build(gapp: &adw::Application) {
     let unplaced_row = adw::ExpanderRow::builder().build();
     unplaced_row.add_prefix(&gtk::Image::from_icon_name("find-location-symbolic"));
     unplaced_group.add(&unplaced_row);
-    let search_group = adw::PreferencesGroup::builder().title("Address search").build();
-    let search_on = adw::SwitchRow::builder()
-        .title("Search in OpenStreetMap")
-        .subtitle("Sends what you search for to OpenStreetMap's Nominatim, and nothing else")
-        .active(retifs_map_core::lookup_allowed())
-        .build();
-    search_group.add(&search_on);
     let status = gtk::Label::builder().xalign(0.0).margin_start(12).margin_bottom(8).css_classes(["dim-label", "caption"]).build();
     let side_inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(24).margin_start(12).margin_end(12).margin_top(12).margin_bottom(12).build();
     side_inner.append(&layers_group);
     side_inner.append(&unplaced_group);
-    side_inner.append(&search_group);
     let side_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     side_box.append(&gtk::ScrolledWindow::builder().child(&side_inner).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build());
     side_box.append(&status);
@@ -151,6 +150,11 @@ fn build(gapp: &adw::Application) {
     let add = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Add a place").build();
     let header = adw::HeaderBar::builder().title_widget(&search).build();
     header.pack_start(&add);
+    let search_on = gio::SimpleAction::new_stateful("online-search", None, &retifs_map_core::lookup_allowed().to_variant());
+    let menu = gio::Menu::new();
+    menu.append(Some("Search addresses online (OpenStreetMap)"), Some("win.online-search"));
+    header.pack_end(&gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).tooltip_text("Menu").build());
+
     let banner = adw::Banner::builder().button_label("Cancel").revealed(false).build();
     let card = adw::ActionRow::builder().build();
     card.add_css_class("card");
@@ -202,6 +206,10 @@ fn build(gapp: &adw::Application) {
         adding: Cell::new(false),
         card_button: card_button.clone(),
         card_action: RefCell::new(None),
+        tilesets: RefCell::new(Vec::new()),
+        base: RefCell::new(None),
+        layers_group: layers_group.clone(),
+        map_rows: RefCell::new(Vec::new()),
     });
     {
         let me2 = me.clone();
@@ -221,11 +229,11 @@ fn build(gapp: &adw::Application) {
     }
     {
         let me2 = me.clone();
-        search_on.connect_active_notify(move |row| {
-            if let Err(e) = retifs_map_core::allow_lookup(row.is_active()) {
-                me2.status.set_text(&format!("Not changed: {e}"));
-            }
+        search_on.connect_activate(move |a, _| {
+            let on = !a.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+            set_online_search(&me2, on);
         });
+        window.add_action(&search_on);
     }
     {
         let me2 = me.clone();
@@ -283,6 +291,10 @@ fn build(gapp: &adw::Application) {
         smap.add_controller(click);
     }
 
+    // OpenStreetMap's servers until the libraries' maps are known.
+    *me.base.borrow_mut() = None;
+    maps_menu(&me);
+    *me.base.borrow_mut() = None;
     reload(&me);
     {
         let me2 = me.clone();
@@ -307,10 +319,15 @@ fn reload(me: &Rc<App>) {
         let libs = m.libraries().unwrap_or_default();
         let r = m.places(&libs);
         let counts = m.change_counts(&libs);
-        (libs, r, counts)
-    }, move |(libs, r, counts)| {
+        let maps = m.tilesets(&libs);
+        (libs, r, counts, maps)
+    }, move |(libs, r, counts, maps)| {
         *me2.libraries.borrow_mut() = libs;
         *me2.counts.borrow_mut() = counts;
+        if maps != *me2.tilesets.borrow() {
+            *me2.tilesets.borrow_mut() = maps;
+            maps_menu(&me2);
+        }
         match r {
             Ok((placed, unplaced)) => {
                 *me2.places.borrow_mut() = placed;
@@ -543,6 +560,13 @@ fn pin(me: &Rc<App>, lat: f64, lon: f64) {
     me.pin_layer.add_marker(&m);
 }
 
+fn set_online_search(me: &Rc<App>, on: bool) {
+    match retifs_map_core::allow_lookup(on) {
+        Ok(()) => me.search_on.set_state(&on.to_variant()),
+        Err(e) => me.status.set_text(&format!("Not changed: {e}")),
+    }
+}
+
 /// Enter in the search field: asks once before anything is sent out.
 fn ask_search(me: &Rc<App>, text: String) {
     if text.trim().is_empty() {
@@ -554,7 +578,7 @@ fn ask_search(me: &Rc<App>, text: String) {
     }
     let d = adw::AlertDialog::builder()
         .heading("Search addresses in OpenStreetMap?")
-        .body("What you search for is sent to OpenStreetMap's Nominatim service, which also sees this computer's address on the internet. Nothing else leaves this device. You can turn it off again in the sidebar.")
+        .body("What you search for is sent to OpenStreetMap's Nominatim service, which also sees this computer's address on the internet. Nothing else leaves this device. You can turn it off again in the menu.")
         .build();
     d.add_responses(&[("cancel", "Not now"), ("on", "Turn on")]);
     d.set_response_appearance("on", adw::ResponseAppearance::Suggested);
@@ -562,7 +586,7 @@ fn ask_search(me: &Rc<App>, text: String) {
     let me2 = me.clone();
     d.connect_response(None, move |_, r| {
         if r == "on" {
-            me2.search_on.set_active(true);
+            set_online_search(&me2, true);
             search(&me2, text.clone());
         }
     });
@@ -670,6 +694,81 @@ fn save_dialog(me: &Rc<App>, name: &str, address: &str, lat: f64, lon: f64) {
         });
     });
     d.present(Some(&me.window));
+}
+
+/// The base maps to choose from: every map in the libraries, and
+/// OpenStreetMap's servers as the fallback. The first time, a map from
+/// retifs is chosen when there is one: no dependence on the internet.
+fn maps_menu(me: &Rc<App>) {
+    // The maps first, then the data layers: everything is taken out and put back in order.
+    for r in me.map_rows.borrow_mut().drain(..) {
+        me.layers_group.remove(&r);
+    }
+    for (_, r) in me.layers.borrow().iter() {
+        me.layers_group.remove(r);
+    }
+    let maps: Vec<Tileset> = me.tilesets.borrow().iter().filter(|t| !t.overlay).cloned().collect();
+    if me.base.borrow().is_none() {
+        let first = maps.first().map(|t| t.id.clone()).unwrap_or_default();
+        set_base(me, &first);
+    }
+    let chosen = me.base.borrow().clone().unwrap_or_default();
+    let mut group: Option<gtk::CheckButton> = None;
+    let mut add = |id: String, title: String, subtitle: String| {
+        let check = gtk::CheckButton::builder().active(id == chosen).valign(gtk::Align::Center).build();
+        if let Some(g) = &group {
+            check.set_group(Some(g));
+        } else {
+            group = Some(check.clone());
+        }
+        let row = adw::ActionRow::builder().title(glib::markup_escape_text(&title)).subtitle(glib::markup_escape_text(&subtitle)).activatable_widget(&check).build();
+        row.add_prefix(&check);
+        me.layers_group.add(&row);
+        me.map_rows.borrow_mut().push(row.clone());
+        let me2 = me.clone();
+        check.connect_toggled(move |c| {
+            if c.is_active() {
+                set_base(&me2, &id);
+            }
+        });
+    };
+    for t in &maps {
+        add(t.id.clone(), t.name.clone(), format!("map from the library {}", t.ns));
+    }
+    add(String::new(), "OpenStreetMap".into(), "over the internet".into());
+    for (_, r) in me.layers.borrow().iter() {
+        me.layers_group.add(r);
+    }
+}
+
+/// Draws the map from a tileset in retifs, or from OpenStreetMap's servers ("").
+fn set_base(me: &Rc<App>, id: &str) {
+    *me.base.borrow_mut() = Some(id.to_string());
+    let t = me.tilesets.borrow().iter().find(|t| t.id == id).cloned();
+    let Some(t) = t else {
+        if let Some(src) = shumate::MapSourceRegistry::with_defaults().by_id("osm-mapnik") {
+            me.smap.set_map_source(Some(&src));
+        }
+        return;
+    };
+    if !shumate::VectorRenderer::is_supported() {
+        me.status.set_text("This libshumate can't draw vector maps");
+        return;
+    }
+    let me2 = me.clone();
+    bg(&me.core, move |m| m.style(&t).map(|s| (t, s)), move |r| match r {
+        Ok((t, style)) => match shumate::VectorRenderer::new(&format!("retifs-{}", t.id), &style) {
+            Ok(renderer) => {
+                renderer.set_name(&t.name);
+                renderer.set_license(&t.attribution);
+                renderer.set_min_zoom_level(t.minzoom.max(0) as u32);
+                renderer.set_max_zoom_level(18);
+                me2.smap.set_map_source(Some(&renderer));
+            }
+            Err(e) => me2.status.set_text(&format!("The map's style: {e}")),
+        },
+        Err(e) => me2.status.set_text(&format!("The map: {e}")),
+    });
 }
 
 /// A marker's picture: the middle square of a thumbnail, small.
