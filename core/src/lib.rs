@@ -360,6 +360,22 @@ impl Map {
         self.call(&mut c, Request::RecordSet { ns: ns.into(), id: id.into(), attrs: vec![(key.into(), geo)], unset: vec![], data: None }).map(|_| ())
     }
 
+    /// Joins a library from its `retifs:` link, as a layer: its places on the
+    /// map, or, if it's a map library, another map. Lazily: a map library is
+    /// big, and only what is looked at is fetched. Its name here.
+    pub fn add_layer(&self, link: &str, name: &str) -> Result<String, String> {
+        let parsed = libretifs::link::Link::parse(link.trim()).map_err(|e| e.to_string())?;
+        let name = if name.trim().is_empty() { libretifs::link::suggest_name(parsed.param("name").unwrap_or("layer")) } else { libretifs::link::suggest_name(name.trim()) };
+        let mut c = self.client()?;
+        let req = if parsed.kind == "invite" {
+            Request::InviteAccept { ns: name.clone(), link: link.trim().into() }
+        } else {
+            let address = parsed.ns_address().ok_or("not a library link")?;
+            Request::NsJoin { ns: name.clone(), address, from: parsed.params_named("from").map(String::from).collect(), lazy: true }
+        };
+        self.call(&mut c, req).map(|_| name)
+    }
+
     /// The maps in `libraries`.
     pub fn tilesets(&self, libraries: &[String]) -> Vec<Tileset> {
         let Ok(mut c) = self.client() else { return Vec::new() };

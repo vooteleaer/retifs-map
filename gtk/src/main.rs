@@ -56,7 +56,6 @@ struct App {
     core: Arc<Map>,
     smap: shumate::SimpleMap,
     layer: shumate::MarkerLayer,
-    layers: RefCell<Vec<(Kind, adw::SwitchRow)>>,
     unplaced_group: adw::PreferencesGroup,
     unplaced_row: adw::ExpanderRow,
     unplaced_rows: RefCell<Vec<gtk::Widget>>,
@@ -86,25 +85,23 @@ struct App {
     card_button: gtk::Button,
     card_action: RefCell<Option<Rc<dyn Fn()>>>,
     /// The maps in the libraries (ADR-0028), and which one is the base: a
-    /// tileset's record ID, or "" for OpenStreetMap's servers (the fallback).
+    /// tileset's record ID, or "" for none (a blank map).
     tilesets: RefCell<Vec<Tileset>>,
     base: RefCell<Option<String>>,
+    /// The layers: libraries. Map libraries to choose the base map from, and
+    /// a switch for each library with places; the ones switched off.
     layers_group: adw::PreferencesGroup,
-    map_rows: RefCell<Vec<adw::ActionRow>>,
+    layer_rows: RefCell<Vec<gtk::Widget>>,
+    hidden: RefCell<HashSet<String>>,
 }
 
 fn build(gapp: &adw::Application) {
     let core = Arc::new(Map::new());
 
     // Sidebar: the layers, and what could still be placed.
-    let layers_group = adw::PreferencesGroup::builder().title("Layers").description("The map underneath comes from a public library you've joined, or from OpenStreetMap over the internet.").build();
-    let mut layers = Vec::new();
-    for (kind, name, icon_name) in KINDS {
-        let row = adw::SwitchRow::builder().title(name).active(true).build();
-        row.add_prefix(&gtk::Image::from_icon_name(icon_name));
-        layers_group.add(&row);
-        layers.push((kind, row));
-    }
+    let layers_group = adw::PreferencesGroup::builder().title("Libraries").description("Maps to draw on, and places to show.").build();
+    let add_layer = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Add a library (its link)").valign(gtk::Align::Center).css_classes(["flat"]).build();
+    layers_group.set_header_suffix(Some(&add_layer));
     let unplaced_group = adw::PreferencesGroup::builder()
         .title("Not on the map yet")
         .description("Contacts and events with an address but no place. Pick one, then click the map or search its address.")
@@ -125,12 +122,8 @@ fn build(gapp: &adw::Application) {
     side_view.set_content(Some(&side_box));
     let side_page = adw::NavigationPage::builder().title("Map").child(&side_view).build();
 
-    // The map, OpenStreetMap's tiles.
+    // The map: tiles only from map libraries in retifs (ADR-0028), never from the internet.
     let smap = shumate::SimpleMap::new();
-    let registry = shumate::MapSourceRegistry::with_defaults();
-    if let Some(src) = registry.by_id("osm-mapnik") {
-        smap.set_map_source(Some(&src));
-    }
     smap.set_vexpand(true);
     smap.set_hexpand(true);
     let viewport = smap.viewport().expect("a viewport");
@@ -179,7 +172,6 @@ fn build(gapp: &adw::Application) {
         core,
         smap: smap.clone(),
         layer,
-        layers: RefCell::new(layers),
         unplaced_group,
         unplaced_row,
         unplaced_rows: RefCell::new(Vec::new()),
@@ -209,8 +201,13 @@ fn build(gapp: &adw::Application) {
         tilesets: RefCell::new(Vec::new()),
         base: RefCell::new(None),
         layers_group: layers_group.clone(),
-        map_rows: RefCell::new(Vec::new()),
+        layer_rows: RefCell::new(Vec::new()),
+        hidden: RefCell::new(HashSet::new()),
     });
+    {
+        let me2 = me.clone();
+        add_layer.connect_clicked(move |_| add_layer_dialog(&me2));
+    }
     {
         let me2 = me.clone();
         card_button.connect_clicked(move |_| {
@@ -247,10 +244,6 @@ fn build(gapp: &adw::Application) {
             me2.banner.set_title("Click the map where the new place is, or search its address");
             me2.banner.set_revealed(true);
         });
-    }
-    for (_, row) in me.layers.borrow().iter() {
-        let me2 = me.clone();
-        row.connect_active_notify(move |_| draw(&me2));
     }
     // Zooming regroups the markers, once per zoom step rather than per frame.
     {
@@ -291,9 +284,8 @@ fn build(gapp: &adw::Application) {
         smap.add_controller(click);
     }
 
-    // OpenStreetMap's servers until the libraries' maps are known.
-    *me.base.borrow_mut() = None;
-    maps_menu(&me);
+    // A blank map until the libraries' maps are known.
+    layers_ui(&me);
     *me.base.borrow_mut() = None;
     reload(&me);
     {
@@ -324,10 +316,7 @@ fn reload(me: &Rc<App>) {
     }, move |(libs, r, counts, maps)| {
         *me2.libraries.borrow_mut() = libs;
         *me2.counts.borrow_mut() = counts;
-        if maps != *me2.tilesets.borrow() {
-            *me2.tilesets.borrow_mut() = maps;
-            maps_menu(&me2);
-        }
+        *me2.tilesets.borrow_mut() = maps;
         match r {
             Ok((placed, unplaced)) => {
                 *me2.places.borrow_mut() = placed;
@@ -343,11 +332,7 @@ fn reload(me: &Rc<App>) {
 
 /// The layers' counts and the records waiting for a place.
 fn sidebar(me: &Rc<App>) {
-    let places = me.places.borrow();
-    for (kind, row) in me.layers.borrow().iter() {
-        let n = places.iter().filter(|p| p.kind == *kind).count();
-        row.set_subtitle(&format!("{n} on the map"));
-    }
+    layers_ui(me);
     for w in me.unplaced_rows.borrow_mut().drain(..) {
         me.unplaced_row.remove(&w);
     }
@@ -378,8 +363,8 @@ fn sidebar(me: &Rc<App>) {
 
 /// Places of the layers that are on.
 fn visible(me: &Rc<App>) -> Vec<Place> {
-    let on: HashSet<Kind> = me.layers.borrow().iter().filter(|(_, r)| r.is_active()).map(|(k, _)| *k).collect();
-    me.places.borrow().iter().filter(|p| on.contains(&p.kind)).cloned().collect()
+    let hidden = me.hidden.borrow();
+    me.places.borrow().iter().filter(|p| !hidden.contains(&p.ns)).cloned().collect()
 }
 
 /// Where a place is on the whole world's map at zoom `z`, in pixels (Web Mercator).
@@ -696,65 +681,95 @@ fn save_dialog(me: &Rc<App>, name: &str, address: &str, lat: f64, lon: f64) {
     d.present(Some(&me.window));
 }
 
-/// The base maps to choose from: every map in the libraries, and
-/// OpenStreetMap's servers as the fallback. The first time, a map from
-/// retifs is chosen when there is one: no dependence on the internet.
-fn maps_menu(me: &Rc<App>) {
-    // The maps first, then the data layers: everything is taken out and put back in order.
-    for r in me.map_rows.borrow_mut().drain(..) {
+/// What a library holds on the map: "8 photos · 1 contact".
+fn holds(places: &[Place], ns: &str) -> String {
+    let words = [(Kind::Photo, "photo", "photos"), (Kind::Person, "contact", "contacts"), (Kind::Event, "event", "events"), (Kind::Other, "place", "places")];
+    words
+        .iter()
+        .filter_map(|(k, one, many)| {
+            let n = places.iter().filter(|p| p.ns == ns && p.kind == *k).count();
+            (n > 0).then(|| format!("{n} {}", if n == 1 { one } else { many }))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The layers, all libraries: first the maps to choose the base map from
+/// (ADR-0028; the first one until the user picks another), then a switch for
+/// each library with places.
+fn layers_ui(me: &Rc<App>) {
+    for r in me.layer_rows.borrow_mut().drain(..) {
         me.layers_group.remove(&r);
     }
-    for (_, r) in me.layers.borrow().iter() {
-        me.layers_group.remove(r);
-    }
     let maps: Vec<Tileset> = me.tilesets.borrow().iter().filter(|t| !t.overlay).cloned().collect();
-    if me.base.borrow().is_none() {
+    if me.base.borrow().is_none() || (!maps.is_empty() && me.base.borrow().as_deref() == Some("")) {
         let first = maps.first().map(|t| t.id.clone()).unwrap_or_default();
         set_base(me, &first);
     }
     let chosen = me.base.borrow().clone().unwrap_or_default();
     let mut group: Option<gtk::CheckButton> = None;
-    let mut add = |id: String, title: String, subtitle: String| {
-        let check = gtk::CheckButton::builder().active(id == chosen).valign(gtk::Align::Center).build();
+    for t in &maps {
+        let check = gtk::CheckButton::builder().active(t.id == chosen).valign(gtk::Align::Center).build();
         if let Some(g) = &group {
             check.set_group(Some(g));
         } else {
             group = Some(check.clone());
         }
-        let row = adw::ActionRow::builder().title(glib::markup_escape_text(&title)).subtitle(glib::markup_escape_text(&subtitle)).activatable_widget(&check).build();
+        let row = adw::ActionRow::builder().title(glib::markup_escape_text(&t.ns)).subtitle(glib::markup_escape_text(&format!("map: {}", t.name))).activatable_widget(&check).build();
         row.add_prefix(&check);
         me.layers_group.add(&row);
-        me.map_rows.borrow_mut().push(row.clone());
-        let me2 = me.clone();
+        me.layer_rows.borrow_mut().push(row.upcast());
+        let (me2, id) = (me.clone(), t.id.clone());
         check.connect_toggled(move |c| {
             if c.is_active() {
                 set_base(&me2, &id);
             }
         });
-    };
-    for t in &maps {
-        add(t.id.clone(), t.name.clone(), format!("map from the library {}", t.ns));
     }
-    add(String::new(), "OpenStreetMap".into(), "over the internet".into());
-    for (_, r) in me.layers.borrow().iter() {
-        me.layers_group.add(r);
+    if maps.is_empty() {
+        let row = adw::ActionRow::builder().title("No map yet").subtitle("Add a map library with +").build();
+        row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+        me.layers_group.add(&row);
+        me.layer_rows.borrow_mut().push(row.upcast());
+    }
+    let places = me.places.borrow();
+    let mut libs: Vec<String> = places.iter().map(|p| p.ns.clone()).collect();
+    libs.sort();
+    libs.dedup();
+    for ns in libs {
+        let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&ns)).subtitle(holds(&places, &ns)).active(!me.hidden.borrow().contains(&ns)).build();
+        let me2 = me.clone();
+        row.connect_active_notify(move |r| {
+            if r.is_active() {
+                me2.hidden.borrow_mut().remove(&ns);
+            } else {
+                me2.hidden.borrow_mut().insert(ns.clone());
+            }
+            draw(&me2);
+        });
+        me.layers_group.add(&row);
+        me.layer_rows.borrow_mut().push(row.upcast());
     }
 }
 
-/// Draws the map from a tileset in retifs, or from OpenStreetMap's servers ("").
+/// Nothing but the land colour: places still show, there's just no map under them.
+const BLANK_STYLE: &str = r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f2efe9"}}]}"##;
+
+/// Draws the map from a tileset in retifs, or a blank one ("").
 fn set_base(me: &Rc<App>, id: &str) {
     *me.base.borrow_mut() = Some(id.to_string());
-    let t = me.tilesets.borrow().iter().find(|t| t.id == id).cloned();
-    let Some(t) = t else {
-        if let Some(src) = shumate::MapSourceRegistry::with_defaults().by_id("osm-mapnik") {
-            me.smap.set_map_source(Some(&src));
-        }
-        return;
-    };
     if !shumate::VectorRenderer::is_supported() {
         me.status.set_text("This libshumate can't draw vector maps");
         return;
     }
+    let t = me.tilesets.borrow().iter().find(|t| t.id == id).cloned();
+    let Some(t) = t else {
+        if let Ok(blank) = shumate::VectorRenderer::new("blank", BLANK_STYLE) {
+            blank.set_max_zoom_level(18);
+            me.smap.set_map_source(Some(&blank));
+        }
+        return;
+    };
     let me2 = me.clone();
     bg(&me.core, move |m| m.style(&t).map(|s| (t, s)), move |r| match r {
         Ok((t, style)) => match shumate::VectorRenderer::new(&format!("retifs-{}", t.id), &style) {
@@ -769,6 +784,45 @@ fn set_base(me: &Rc<App>, id: &str) {
         },
         Err(e) => me2.status.set_text(&format!("The map: {e}")),
     });
+}
+
+/// Adds a layer: joins a library from its `retifs:` link.
+fn add_layer_dialog(me: &Rc<App>) {
+    let link_row = adw::EntryRow::builder().title("Link (retifs:…)").build();
+    let name_row = adw::EntryRow::builder().title("Name here (optional)").build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&link_row);
+    group.add(&name_row);
+    let d = adw::AlertDialog::builder()
+        .heading("Add a library")
+        .body("A library's link: its places come onto the map, or, for a map library, its map. Only what you look at is fetched.")
+        .extra_child(&group)
+        .build();
+    d.add_responses(&[("cancel", "Cancel"), ("add", "Add")]);
+    d.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    d.set_default_response(Some("add"));
+    d.set_response_enabled("add", false);
+    {
+        let d2 = d.clone();
+        link_row.connect_changed(move |e| d2.set_response_enabled("add", e.text().trim().starts_with("retifs:")));
+    }
+    let me2 = me.clone();
+    d.connect_response(None, move |_, r| {
+        if r != "add" {
+            return;
+        }
+        let (link, name) = (link_row.text().to_string(), name_row.text().to_string());
+        let me3 = me2.clone();
+        me2.status.set_text("Adding the library…");
+        bg(&me2.core, move |m| m.add_layer(&link, &name), move |r| {
+            match r {
+                Ok(ns) => me3.status.set_text(&format!("Added {ns}: it fills in as it syncs")),
+                Err(e) => me3.status.set_text(&format!("Not added: {e}")),
+            }
+            reload(&me3);
+        });
+    });
+    d.present(Some(&me.window));
 }
 
 /// A marker's picture: the middle square of a thumbnail, small.
