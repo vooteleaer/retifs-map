@@ -2,12 +2,13 @@
 """OpenStreetMap points of interest as place records (ADR-0027, ADR-0028).
 
 Reads `osmium export -f geojsonseq` output on stdin and writes one record per
-line for `retifs rec import` (KEY=VALUE, tab-separated). Areas become a point
-at the middle of their outline.
+line as JSON, for `retifs-map-import places`. Areas become a point at the
+middle of their outline. Each place gets a `minzoom`: from which zoom a map
+shows it, by how much it matters (as OpenStreetMap's own map does).
 
     osmium tags-filter in.osm.pbf nwr/amenity nwr/shop ... -o poi.osm.pbf
-    osmium export poi.osm.pbf -f geojsonseq -a type,id | osm-places.py > places.tsv
-    retifs rec import NS < places.tsv
+    osmium export poi.osm.pbf -f geojsonseq -a type,id | osm-places.py > places.jsonl
+    retifs-map-import places places.jsonl --ns NS
 """
 import json
 import sys
@@ -19,6 +20,31 @@ CLASSES = ["amenity", "shop", "tourism", "leisure", "historic", "healthcare", "o
 NATURAL = {"peak", "spring", "beach", "cave_entrance", "bay", "cape", "rock", "stone", "waterfall"}
 SKIP = {"parking", "parking_space", "bench", "waste_basket", "bicycle_parking", "toilets", "vending_machine", "shelter_type", "grit_bin", "recycling", "post_box", "telephone", "fountain", "hunting_stand", "fire_hydrant"}
 KEEP = {"opening_hours": "opening_hours", "website": "website", "contact:website": "website", "phone": "phone", "contact:phone": "phone", "wheelchair": "wheelchair", "cuisine": "cuisine", "description": "note", "wikipedia": "wikipedia"}
+
+
+# From which zoom a place shows: the landmarks early, the everyday later, the
+# small things only close up. Anything not listed: 16 (a shop: 15).
+ZOOM = {
+    12: {"hospital", "university", "castle", "manor", "zoo", "theme_park", "stadium", "aerodrome", "airport", "ferry_terminal"},
+    13: {"museum", "theatre", "cinema", "townhall", "college", "place_of_worship", "monastery", "hotel", "camp_site", "viewpoint",
+         "attraction", "peak", "beach", "library", "police", "fire_station", "ruins", "monument", "fort", "lighthouse", "spa",
+         "nature_reserve", "golf_course", "marina", "arts_centre", "courthouse", "bus_station", "mall", "department_store"},
+    14: {"supermarket", "fuel", "school", "guest_house", "hostel", "chalet", "sports_centre", "swimming_pool", "park",
+         "community_centre", "post_office", "pharmacy", "clinic", "memorial", "archaeological_site", "spring", "waterfall",
+         "cave_entrance", "gallery", "information_office", "charging_station"},
+    15: {"restaurant", "cafe", "bar", "pub", "fast_food", "bank", "doctors", "dentist", "kindergarten", "convenience",
+         "bakery", "car_repair", "hardware", "clothes", "veterinary", "marketplace", "swimming_area", "sauna", "car_wash"},
+    17: {"information", "picnic_site", "playground", "bbq", "firepit", "drinking_water", "atm", "boundary_stone", "wayside_cross",
+         "wayside_shrine", "stone", "rock", "pitch", "fitness_station", "bird_hide", "hunting_stand"},
+}
+
+
+def minzoom(cls, value, tags):
+    z = next((z for z, names in ZOOM.items() if value in names), 15 if cls == "shop" else 16)
+    # Better known: earlier (it has an encyclopedia article).
+    if "wikipedia" in tags or "wikidata" in tags:
+        z -= 2
+    return max(z, 10)
 
 
 # An area wider than this (degrees) isn't a place on the map but a region
@@ -41,7 +67,7 @@ def middle(geom):
 
 
 def clean(v):
-    return " ".join(str(v).split()).replace("=", "-")
+    return " ".join(str(v).split())
 
 
 n = 0
@@ -64,8 +90,9 @@ for line in sys.stdin:
     rec = {
         "type": PLACE_TYPE,
         "name": clean(name),
-        "geo": f"{lat:.6f},{lon:.6f}",
+        "geo": [round(lat, 6), round(lon, 6)],
         "category": clean(tags[cls]),
+        "minzoom": minzoom(cls, tags[cls], tags),
         "osm:class": cls,
         "source": f"osm:{tags.get('@type', 'node')}/{tags.get('@id', '')}",
     }
@@ -76,7 +103,6 @@ for line in sys.stdin:
     for k, to in KEEP.items():
         if k in tags and to not in rec:
             rec[to] = clean(tags[k])
-    # Quoted, so commas stay text (only geo is a list).
-    print("\t".join(f"{k}={v}" if k == "geo" else f'{k}="{v}"' for k, v in rec.items()))
+    print(json.dumps(rec, ensure_ascii=False))
     n += 1
 print(f"{n} places", file=sys.stderr)

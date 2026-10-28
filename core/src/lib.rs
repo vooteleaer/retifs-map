@@ -51,6 +51,9 @@ pub struct Place {
     pub when: String,
     /// What it is, in a word or two: a place's category ("cafe"), else "".
     pub detail: String,
+    /// A map's place (a public library's café): from which zoom it shows
+    /// (ADR-0028). None for the user's own things, which are always shown.
+    pub minzoom: Option<i64>,
     /// The first content block's read-cap (a photo), and its thumbnail's.
     pub thumb: Option<String>,
 }
@@ -107,11 +110,12 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
     });
     let thumb = (kind == Kind::Photo).then(|| thumb_index.and_then(|i| r.blocks.get(i)).or(r.blocks.first()).cloned()).flatten();
     let detail = text(r, "category").map(|c| c.replace('_', " ")).unwrap_or_default();
+    let minzoom = r.attrs.iter().find(|(k, _)| k == "minzoom").and_then(|(_, v)| if let AttrValue::Int(i) = v { Some(*i) } else { None });
     let mut placed = Vec::new();
     for (k, v) in &r.attrs {
         let label = if k == "geo" { "" } else if let Some(l) = k.strip_prefix("geo:") { l } else { continue };
         if let Some((lat, lon)) = latlon(v) {
-            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), detail: detail.clone(), thumb: thumb.clone() });
+            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), detail: detail.clone(), minzoom, thumb: thumb.clone() });
         }
     }
     // Addresses (contacts) and locations (events) without coordinates.

@@ -5,6 +5,10 @@
 //!
 //!     retifs-map-import tiles DIR --ns NS --name NAME [--style FILE]
 //!         [--source TEXT] [--source-date DATE] [--overlay] [--replace]
+//!     retifs-map-import places FILE.jsonl --ns NS [--replace]
+//!
+//! `places` takes one record per line as a JSON object (osm-places.py
+//! writes them): strings, numbers, booleans and lists become attributes.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,6 +24,7 @@ const BATCH_BYTES: usize = 16 << 20;
 
 fn usage() -> ! {
     eprintln!("retifs-map-import tiles DIR --ns NS --name NAME [--style FILE] [--source TEXT] [--source-date DATE] [--overlay] [--replace]");
+    eprintln!("retifs-map-import places FILE.jsonl --ns NS [--replace]");
     std::process::exit(2)
 }
 
@@ -29,6 +34,7 @@ fn fail(e: impl std::fmt::Display) -> ! {
 }
 
 struct Opts {
+    places: bool,
     dir: PathBuf,
     ns: String,
     name: String,
@@ -41,11 +47,13 @@ struct Opts {
 
 fn opts() -> Opts {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("tiles") {
-        usage();
-    }
+    let places = match args.next().as_deref() {
+        Some("tiles") => false,
+        Some("places") => true,
+        _ => usage(),
+    };
     let dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
-    let mut o = Opts { dir, ns: String::new(), name: String::new(), style: None, source: "OpenStreetMap".into(), source_date: String::new(), overlay: false, replace: false };
+    let mut o = Opts { places, dir, ns: String::new(), name: String::new(), style: None, source: "OpenStreetMap".into(), source_date: String::new(), overlay: false, replace: false };
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -59,7 +67,7 @@ fn opts() -> Opts {
             _ => usage(),
         }
     }
-    if o.ns.is_empty() || o.name.is_empty() {
+    if o.ns.is_empty() || (o.name.is_empty() && !o.places) {
         usage();
     }
     o
@@ -102,10 +110,59 @@ async fn query(c: &mut Client, ns: &str, term: &str) -> Vec<String> {
     }
 }
 
+fn attr(v: &serde_json::Value) -> Option<AttrValue> {
+    Some(match v {
+        serde_json::Value::String(t) => AttrValue::Str(t.clone()),
+        serde_json::Value::Bool(b) => AttrValue::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => AttrValue::Int(i),
+            None => AttrValue::Float(n.as_f64()?),
+        },
+        serde_json::Value::Array(a) => AttrValue::List(a.iter().map(attr).collect::<Option<Vec<_>>>()?),
+        _ => return None,
+    })
+}
+
+/// Places, one JSON object per line, into `ns` (after deleting the places
+/// there with --replace).
+async fn places(c: &mut Client, o: &Opts) {
+    let text = std::fs::read_to_string(&o.dir).unwrap_or_else(|e| fail(format!("{}: {e}", o.dir.display())));
+    let old = query(c, &o.ns, "type=application/x-vnd.retifs.place").await;
+    if !old.is_empty() && !o.replace {
+        fail(format!("{} already has {} place(s); --replace to rebuild it", o.ns, old.len()));
+    }
+    let started = Instant::now();
+    for ids in old.chunks(BATCH) {
+        call(c, Request::Transaction { ns: o.ns.clone(), steps: ids.iter().map(|id| TxStep::Delete { id: id.clone() }).collect() }).await;
+    }
+    if !old.is_empty() {
+        eprintln!("{} old place(s) deleted in {:.0} s", old.len(), started.elapsed().as_secs_f64());
+    }
+    let (mut steps, mut done) = (Vec::new(), 0usize);
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| fail(format!("{e}: {line}")));
+        let attrs: Vec<(String, AttrValue)> = v.as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), attr(v)?))).collect();
+        steps.push(TxStep::Create { attrs, data: None });
+        if steps.len() == BATCH {
+            done += steps.len();
+            call(c, Request::Transaction { ns: o.ns.clone(), steps: std::mem::take(&mut steps) }).await;
+        }
+    }
+    if !steps.is_empty() {
+        done += steps.len();
+        call(c, Request::Transaction { ns: o.ns.clone(), steps }).await;
+    }
+    println!("{done} places in {} ({:.0} s)", o.ns, started.elapsed().as_secs_f64());
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let o = opts();
     let mut c = Client::connect(&libretifs::default_store_dir()).await.unwrap_or_else(|e| fail(e));
+    if o.places {
+        places(&mut c, &o).await;
+        return;
+    }
     let found = tiles(&o.dir);
     if found.is_empty() {
         fail(format!("no tiles under {}", o.dir.display()));

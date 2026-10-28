@@ -102,6 +102,14 @@ struct App {
 
 fn build(gapp: &adw::Application) {
     let core = Arc::new(Map::new());
+    // The map's places: small dots, names on a light label.
+    let css = gtk::CssProvider::new();
+    css.load_from_string(
+        ".map-place { min-width: 22px; min-height: 22px; padding: 1px; }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; }",
+    );
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
 
     // Sidebar: the layers, and what could still be placed.
     let layers_group = adw::PreferencesGroup::builder().title("Libraries").description("Maps to draw on, and places to show.").build();
@@ -421,33 +429,103 @@ fn draw(me: &Rc<App>) {
     let places = visible(me);
     if !me.fitted.get() && !places.is_empty() {
         me.fitted.set(true);
-        // Around the user's own things: a library of thousands of places
-        // (a public one, all of a country's cafés) would show the whole country.
+        // Around the user's own things: the map's places (a country's cafés)
+        // and libraries of thousands would show the whole country.
         let mut per_lib: HashMap<&str, usize> = HashMap::new();
         for p in &places {
             *per_lib.entry(p.ns.as_str()).or_default() += 1;
         }
-        let own: Vec<Place> = places.iter().filter(|p| per_lib[p.ns.as_str()] <= FIT_MAX).cloned().collect();
+        let own: Vec<Place> = places.iter().filter(|p| p.minzoom.is_none() && per_lib[p.ns.as_str()] <= FIT_MAX).cloned().collect();
         fit(me, if own.is_empty() { &places } else { &own });
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
     me.zoom.set(z as i32);
-    // Grouped over everything (so groups don't change as the map moves), but
-    // only those on screen, and a screen around it, get a marker.
-    let mut groups = groups(places, z);
-    if let Some(vp) = me.smap.viewport() {
-        let (cx, cy) = pixel(vp.latitude(), vp.longitude(), z);
-        let (w, h) = (me.smap.width().max(800) as f64, me.smap.height().max(600) as f64);
-        groups.retain(|g| {
-            let (x, y) = pixel(g.members[0].lat, g.members[0].lon, z);
-            (x - cx).abs() < w * 1.5 && (y - cy).abs() < h * 1.5
-        });
-    }
+    // Only what's on screen, and a screen around it, gets a marker.
+    let on_screen: Box<dyn Fn(f64, f64) -> bool> = match me.smap.viewport() {
+        Some(vp) => {
+            let (cx, cy) = pixel(vp.latitude(), vp.longitude(), z);
+            let (w, h) = (me.smap.width().max(800) as f64, me.smap.height().max(600) as f64);
+            Box::new(move |lat, lon| {
+                let (x, y) = pixel(lat, lon, z);
+                (x - cx).abs() < w * 1.5 && (y - cy).abs() < h * 1.5
+            })
+        }
+        None => Box::new(|_, _| true),
+    };
+    let (map_places, own): (Vec<Place>, Vec<Place>) = places.into_iter().partition(|p| p.minzoom.is_some());
     me.layer.remove_all();
+    // The map's places, as a map shows them: those that matter at this zoom,
+    // the more important first, and none on top of another.
+    for p in declutter(map_places.into_iter().filter(|p| p.minzoom.unwrap_or(0) as f64 <= z && on_screen(p.lat, p.lon)).collect(), z) {
+        me.layer.add_marker(&place_marker(me, &p, z));
+    }
+    // The user's own things: grouped over everything (so groups don't change
+    // as the map moves), drawn above the map's places.
+    let mut groups = groups(own, z);
+    groups.retain(|g| on_screen(g.members[0].lat, g.members[0].lon));
     for g in &groups {
         me.layer.add_marker(&marker(me, g));
     }
     load_thumbs(me, &groups);
+}
+
+/// Places closer than this (pixels) to one already shown are left out.
+const SPACING: f64 = 30.0;
+/// From this zoom the map's places have their names beside them.
+const NAMES_FROM: f64 = 16.0;
+
+/// The places to show, most important (lowest minzoom) first, leaving out any
+/// that would crowd one already in.
+fn declutter(mut places: Vec<Place>, z: f64) -> Vec<Place> {
+    places.sort_by(|a, b| a.minzoom.cmp(&b.minzoom).then(a.title.cmp(&b.title)));
+    let mut taken: HashMap<(i64, i64), Vec<(f64, f64)>> = HashMap::new();
+    let mut out = Vec::new();
+    for p in places {
+        let (x, y) = pixel(p.lat, p.lon, z);
+        let (cx, cy) = ((x / SPACING).floor() as i64, (y / SPACING).floor() as i64);
+        let crowded = (-1..=1).any(|dx| (-1..=1).any(|dy| taken.get(&(cx + dx, cy + dy)).is_some_and(|v| v.iter().any(|(ox, oy)| (ox - x).hypot(oy - y) < SPACING))));
+        if !crowded {
+            taken.entry((cx, cy)).or_default().push((x, y));
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A map's place: a small dot with what it is, its name when close in.
+fn place_marker(me: &Rc<App>, p: &Place, z: f64) -> shumate::Marker {
+    let m = shumate::Marker::new();
+    m.set_location(p.lat, p.lon);
+    let dot = gtk::Button::builder().css_classes(["circular", "osd", "map-place"]).tooltip_text(format!("{} ({})", p.title, p.detail)).build();
+    dot.set_child(Some(&gtk::Image::builder().icon_name(category_icon(&p.detail)).pixel_size(12).build()));
+    let (me2, p2) = (me.clone(), p.clone());
+    dot.connect_clicked(move |_| focus(&me2, &p2, 1));
+    if z >= NAMES_FROM {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        row.append(&dot);
+        row.append(&gtk::Label::builder().label(&p.title).css_classes(["caption", "map-name"]).build());
+        m.set_child(Some(&row));
+    } else {
+        m.set_child(Some(&dot));
+    }
+    m
+}
+
+/// An icon for what a place is (the symbolic icons every GNOME has).
+fn category_icon(category: &str) -> &'static str {
+    match category {
+        "restaurant" | "cafe" | "fast food" | "bar" | "pub" | "bakery" => "emoji-food-symbolic",
+        "hotel" | "guest house" | "hostel" | "chalet" | "camp site" | "shelter" => "user-home-symbolic",
+        "museum" | "gallery" | "arts centre" | "theatre" | "cinema" => "emoji-symbols-symbolic",
+        "school" | "kindergarten" | "college" | "university" | "library" => "accessories-dictionary-symbolic",
+        "hospital" | "clinic" | "doctors" | "dentist" | "pharmacy" | "veterinary" => "emblem-important-symbolic",
+        "fuel" | "charging station" | "car repair" | "car wash" => "battery-full-charged-symbolic",
+        "place of worship" | "monastery" => "starred-symbolic",
+        "park" | "nature reserve" | "playground" | "picnic site" | "beach" | "swimming area" => "emoji-nature-symbolic",
+        "supermarket" | "convenience" | "mall" | "department store" | "marketplace" => "emoji-objects-symbolic",
+        "viewpoint" | "attraction" | "peak" | "lighthouse" => "camera-photo-symbolic",
+        _ => "mark-location-symbolic",
+    }
 }
 
 /// Draws again once the map has stopped moving for a moment.
