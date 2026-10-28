@@ -6,6 +6,8 @@
 //! user turns it on); new places are saved as records of their own. It
 //! updates as the libraries change.
 
+mod icons;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -104,8 +106,10 @@ fn build(gapp: &adw::Application) {
     let core = Arc::new(Map::new());
     // The map's places: small dots, names on a light label.
     let css = gtk::CssProvider::new();
-    css.load_from_string(
-        ".map-place { min-width: 22px; min-height: 22px; padding: 1px; }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; }",
+    css.load_from_string(&(
+        ".map-place { min-width: 20px; min-height: 20px; padding: 2px; border: 1.5px solid white; box-shadow: 0 1px 2px alpha(black, 0.4); }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; } "
+            .to_string()
+            + &icons::css()),
     );
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -436,7 +440,15 @@ fn draw(me: &Rc<App>) {
             *per_lib.entry(p.ns.as_str()).or_default() += 1;
         }
         let own: Vec<Place> = places.iter().filter(|p| p.minzoom.is_none() && per_lib[p.ns.as_str()] <= FIT_MAX).cloned().collect();
-        fit(me, if own.is_empty() { &places } else { &own });
+        // RETIFS_MAP_VIEW=lat,lon,zoom: where to open instead (demos).
+        let view: Option<Vec<f64>> = std::env::var("RETIFS_MAP_VIEW").ok().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+        match (view.as_deref(), me.smap.map(), me.smap.viewport()) {
+            (Some([lat, lon, z]), Some(map), Some(vp)) => {
+                vp.set_zoom_level(*z);
+                map.center_on(*lat, *lon);
+            }
+            _ => fit(me, if own.is_empty() { &places } else { &own }),
+        }
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
     me.zoom.set(z as i32);
@@ -496,8 +508,11 @@ fn declutter(mut places: Vec<Place>, z: f64) -> Vec<Place> {
 fn place_marker(me: &Rc<App>, p: &Place, z: f64) -> shumate::Marker {
     let m = shumate::Marker::new();
     m.set_location(p.lat, p.lon);
-    let dot = gtk::Button::builder().css_classes(["circular", "osd", "map-place"]).tooltip_text(format!("{} ({})", p.title, p.detail)).build();
-    dot.set_child(Some(&gtk::Image::builder().icon_name(category_icon(&p.detail)).pixel_size(12).build()));
+    let (icon, group) = icons::style_of(&p.detail);
+    let dot = gtk::Button::builder().css_classes(["circular", "map-place", &format!("pc-{group}")]).tooltip_text(format!("{} ({})", p.title, p.detail)).build();
+    if let Some(t) = icons::texture(icon, 14) {
+        dot.set_child(Some(&gtk::Image::builder().paintable(&t).pixel_size(14).build()));
+    }
     let (me2, p2) = (me.clone(), p.clone());
     dot.connect_clicked(move |_| focus(&me2, &p2, 1));
     if z >= NAMES_FROM {
@@ -511,22 +526,6 @@ fn place_marker(me: &Rc<App>, p: &Place, z: f64) -> shumate::Marker {
     m
 }
 
-/// An icon for what a place is (the symbolic icons every GNOME has).
-fn category_icon(category: &str) -> &'static str {
-    match category {
-        "restaurant" | "cafe" | "fast food" | "bar" | "pub" | "bakery" => "emoji-food-symbolic",
-        "hotel" | "guest house" | "hostel" | "chalet" | "camp site" | "shelter" => "user-home-symbolic",
-        "museum" | "gallery" | "arts centre" | "theatre" | "cinema" => "emoji-symbols-symbolic",
-        "school" | "kindergarten" | "college" | "university" | "library" => "accessories-dictionary-symbolic",
-        "hospital" | "clinic" | "doctors" | "dentist" | "pharmacy" | "veterinary" => "emblem-important-symbolic",
-        "fuel" | "charging station" | "car repair" | "car wash" => "battery-full-charged-symbolic",
-        "place of worship" | "monastery" => "starred-symbolic",
-        "park" | "nature reserve" | "playground" | "picnic site" | "beach" | "swimming area" => "emoji-nature-symbolic",
-        "supermarket" | "convenience" | "mall" | "department store" | "marketplace" => "emoji-objects-symbolic",
-        "viewpoint" | "attraction" | "peak" | "lighthouse" => "camera-photo-symbolic",
-        _ => "mark-location-symbolic",
-    }
-}
 
 /// Draws again once the map has stopped moving for a moment.
 fn draw_soon(me: &Rc<App>) {
