@@ -455,7 +455,11 @@ fn ask_cells(me: &Rc<App>, z: f64) {
     }
     let (north, west) = vp.widget_coords_to_location(&me.smap, 0.0, 0.0);
     let (south, east) = vp.widget_coords_to_location(&me.smap, w, h);
-    let cells = Map::cells(west, south, east, north);
+    // Landmarks in zoom-12 cells from zoom 12; the rest in zoom-14 cells from 14.
+    let mut cells = Map::cells(west, south, east, north);
+    if z >= 14.0 {
+        cells.extend(Map::cells_at(14, west, south, east, north));
+    }
     for ns in me.lazy.borrow().iter().filter(|n| !me.hidden.borrow().contains(*n)) {
         let missing: Vec<String> = cells.iter().filter(|c| !me.cells_asked.borrow().contains(&(ns.clone(), (*c).clone()))).take(16).cloned().collect();
         if missing.is_empty() {

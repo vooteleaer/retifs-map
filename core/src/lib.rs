@@ -372,8 +372,14 @@ impl Map {
 
     /// The zoom-12 cells around a view: `cell`'s values to ask for.
     pub fn cells(west: f64, south: f64, east: f64, north: f64) -> Vec<String> {
+        Self::cells_at(12, west, south, east, north)
+    }
+
+    /// The cells of zoom `z` around a view (places are in zoom-12 cells if
+    /// they show from zoom 13 or earlier, else in zoom-14 cells).
+    pub fn cells_at(z: u32, west: f64, south: f64, east: f64, north: f64) -> Vec<String> {
         let tile = |lat: f64, lon: f64| {
-            let n = 4096.0;
+            let n = 2f64.powi(z as i32);
             let x = ((lon + 180.0) / 360.0 * n).floor() as i64;
             let phi = lat.clamp(-85.05, 85.05).to_radians();
             let y = ((1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor() as i64;
@@ -381,7 +387,7 @@ impl Map {
         };
         let (x0, y0) = tile(north, west);
         let (x1, y1) = tile(south, east);
-        (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| format!("12/{x}/{y}"))).collect()
+        (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| format!("{z}/{x}/{y}"))).collect()
     }
 
     pub fn places(&self, libraries: &[String]) -> Result<(Vec<Place>, Vec<Unplaced>), String> {
@@ -560,6 +566,7 @@ mod tests {
     fn cells_around_a_view() {
         assert_eq!(Map::cells(24.744, 59.436, 24.746, 59.438), vec!["12/2329/1202".to_string()]);
         assert_eq!(Map::cells(24.70, 59.40, 24.80, 59.45).len(), 2 * 3);
+        assert_eq!(Map::cells_at(14, 24.744, 59.436, 24.746, 59.438), vec!["14/9318/4808".to_string()]);
     }
 
     #[test]
