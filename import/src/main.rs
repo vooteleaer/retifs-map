@@ -5,10 +5,13 @@
 //!
 //!     retifs-map-import tiles DIR --ns NS --name NAME [--style FILE]
 //!         [--source TEXT] [--source-date DATE] [--overlay] [--replace]
-//!     retifs-map-import places FILE.jsonl --ns NS [--replace]
+//!     retifs-map-import places FILE.jsonl --ns NS [--type TYPE] [--index KEYS] [--replace]
 //!
-//! `places` takes one record per line as a JSON object (osm-places.py
-//! writes them): strings, numbers, booleans and lists become attributes.
+//! `places` takes one record per line as a JSON object (osm-places.py and
+//! osm-addresses.py write them): strings, numbers, booleans and lists become
+//! attributes. `--type`: the records' type, those replaced (default places);
+//! `--index`: the keys a search node may answer for (ADR-0019), as the
+//! library's index settings.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -17,6 +20,7 @@ use libretifs::{AttrValue, Client, Request, Response, TxStep};
 
 pub const TILESET_TYPE: &str = "application/x-vnd.retifs.tileset";
 pub const VECTOR_TILE: &str = "application/vnd.mapbox-vector-tile";
+pub const PLACE_TYPE: &str = "application/x-vnd.retifs.place";
 
 /// Records per transaction, and the most tile data in one.
 const BATCH: usize = 500;
@@ -24,7 +28,7 @@ const BATCH_BYTES: usize = 16 << 20;
 
 fn usage() -> ! {
     eprintln!("retifs-map-import tiles DIR --ns NS --name NAME [--style FILE] [--source TEXT] [--source-date DATE] [--overlay] [--replace]");
-    eprintln!("retifs-map-import places FILE.jsonl --ns NS [--replace]");
+    eprintln!("retifs-map-import places FILE.jsonl --ns NS [--type TYPE] [--index KEYS] [--replace]");
     std::process::exit(2)
 }
 
@@ -43,6 +47,8 @@ struct Opts {
     source_date: String,
     overlay: bool,
     replace: bool,
+    kind: String,
+    index: Option<String>,
 }
 
 fn opts() -> Opts {
@@ -53,7 +59,7 @@ fn opts() -> Opts {
         _ => usage(),
     };
     let dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
-    let mut o = Opts { places, dir, ns: String::new(), name: String::new(), style: None, source: "OpenStreetMap".into(), source_date: String::new(), overlay: false, replace: false };
+    let mut o = Opts { places, dir, ns: String::new(), name: String::new(), style: None, source: "OpenStreetMap".into(), source_date: String::new(), overlay: false, replace: false, kind: PLACE_TYPE.into(), index: None };
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -64,6 +70,8 @@ fn opts() -> Opts {
             "--source-date" => o.source_date = val(),
             "--overlay" => o.overlay = true,
             "--replace" => o.replace = true,
+            "--type" => o.kind = val(),
+            "--index" => o.index = Some(val()),
             _ => usage(),
         }
     }
@@ -127,9 +135,9 @@ fn attr(v: &serde_json::Value) -> Option<AttrValue> {
 /// there with --replace).
 async fn places(c: &mut Client, o: &Opts) {
     let text = std::fs::read_to_string(&o.dir).unwrap_or_else(|e| fail(format!("{}: {e}", o.dir.display())));
-    let old = query(c, &o.ns, "type=application/x-vnd.retifs.place").await;
+    let old = query(c, &o.ns, &format!("type={}", o.kind)).await;
     if !old.is_empty() && !o.replace {
-        fail(format!("{} already has {} place(s); --replace to rebuild it", o.ns, old.len()));
+        fail(format!("{} already has {} record(s) of {}; --replace to rebuild it", o.ns, old.len(), o.kind));
     }
     let started = Instant::now();
     for ids in old.chunks(BATCH) {
@@ -152,7 +160,15 @@ async fn places(c: &mut Client, o: &Opts) {
         done += steps.len();
         call(c, Request::Transaction { ns: o.ns.clone(), steps }).await;
     }
-    println!("{done} places in {} ({:.0} s)", o.ns, started.elapsed().as_secs_f64());
+    if let Some(keys) = &o.index {
+        // One settings record: the keys searched for, replacing any before.
+        let old = query(c, &o.ns, "type=retifs.index").await;
+        let mut steps: Vec<TxStep> = old.into_iter().map(|id| TxStep::Delete { id }).collect();
+        let keys = AttrValue::List(keys.split(',').map(|k| s(k.trim())).collect());
+        steps.push(TxStep::Create { attrs: vec![("type".into(), s("retifs.index")), ("keys".into(), keys)], data: None });
+        call(c, Request::Transaction { ns: o.ns.clone(), steps }).await;
+    }
+    println!("{done} records in {} ({:.0} s)", o.ns, started.elapsed().as_secs_f64());
 }
 
 #[tokio::main(flavor = "current_thread")]

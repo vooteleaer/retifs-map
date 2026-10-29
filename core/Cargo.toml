@@ -9,6 +9,6 @@ publish.workspace = true
 [dependencies]
 libretifs = { path = "../../retifs/crates/libretifs" }
 tokio = { version = "1", features = ["rt"] }
-# Address lookup (ADR-0027, only once the user turns it on).
-ureq = "2"
 serde_json = "1"
+# Address search folds text as the importer does (NFKD, no marks).
+unicode-normalization = "0.1"

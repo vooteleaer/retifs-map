@@ -81,10 +81,11 @@ struct App {
     window: adw::ApplicationWindow,
     search: gtk::SearchEntry,
     /// "Search addresses online" in the main menu: off until the user agrees.
-    search_on: gio::SimpleAction,
     results: gtk::ListBox,
     results_pop: gtk::Popover,
     found: RefCell<Vec<Found>>,
+    /// Address searches started: an answer to an older one is dropped.
+    searches: Cell<u64>,
     /// A spot picked but not saved: a search result or a click while adding.
     pin_layer: shumate::MarkerLayer,
     adding: Cell<bool>,
@@ -104,6 +105,8 @@ struct App {
     /// Libraries held lazily: their places are asked for by the cells on
     /// screen (ADR-0031), kept per (library, cell) until they change.
     lazy: RefCell<Vec<String>>,
+    /// Address libraries: searched from the search field, not drawn.
+    addressed: RefCell<Vec<String>>,
     cell_places: RefCell<HashMap<(String, String), Vec<Place>>>,
     cells_asked: RefCell<HashSet<(String, String)>>,
     /// The user switched the map off themselves: don't pick one for them.
@@ -179,10 +182,6 @@ fn build(gapp: &adw::Application) {
     let add = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Add a place").build();
     let header = adw::HeaderBar::builder().title_widget(&search).build();
     header.pack_start(&add);
-    let search_on = gio::SimpleAction::new_stateful("online-search", None, &retifs_map_core::lookup_allowed().to_variant());
-    let menu = gio::Menu::new();
-    menu.append(Some("Search addresses online (OpenStreetMap)"), Some("win.online-search"));
-    header.pack_end(&gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).tooltip_text("Menu").build());
     // Public libraries heard on the network, as LXMF apps list announces (ADR-0029).
     let announces = gtk::Button::builder().label("Announces").tooltip_text("Public libraries heard on the network").build();
     header.pack_end(&announces);
@@ -229,10 +228,10 @@ fn build(gapp: &adw::Application) {
         zoom: Cell::new(-1),
         window: window.clone(),
         search: search.clone(),
-        search_on: search_on.clone(),
         results,
         results_pop,
         found: RefCell::new(Vec::new()),
+        searches: Cell::new(0),
         pin_layer,
         adding: Cell::new(false),
         card_button: card_button.clone(),
@@ -244,6 +243,7 @@ fn build(gapp: &adw::Application) {
         hidden: RefCell::new(HashSet::new()),
         joined: RefCell::new(Vec::new()),
         lazy: RefCell::new(Vec::new()),
+        addressed: RefCell::new(Vec::new()),
         cell_places: RefCell::new(HashMap::new()),
         cells_asked: RefCell::new(HashSet::new()),
         base_drawn: Cell::new(std::time::Instant::now()),
@@ -280,15 +280,16 @@ fn build(gapp: &adw::Application) {
     }
     {
         let me2 = me.clone();
-        search_on.connect_activate(move |a, _| {
-            let on = !a.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
-            set_online_search(&me2, on);
-        });
-        window.add_action(&search_on);
-    }
-    {
+        search.connect_activate(move |e| find(&me2, e.text().to_string(), true));
+        // As it's typed, too.
+        search.set_search_delay(350);
         let me2 = me.clone();
-        search.connect_activate(move |e| ask_search(&me2, e.text().to_string()));
+        search.connect_search_changed(move |e| {
+            let text = e.text().to_string();
+            if retifs_map_core::fold(&text).concat().chars().count() >= 3 {
+                find(&me2, text, false);
+            }
+        });
     }
     {
         let me2 = me.clone();
@@ -381,6 +382,7 @@ fn build(gapp: &adw::Application) {
         });
     }
     snapshot_on_request(&window);
+    demo_search(&me);
     window.present();
 }
 
@@ -395,9 +397,11 @@ fn reload(me: &Rc<App>) {
         let counts = m.change_counts(&libs);
         let maps = m.tilesets(&libs);
         let joined = m.joined(&libs);
-        (libs, r, counts, maps, joined, lazy)
-    }, move |(libs, r, counts, maps, joined, lazy)| {
+        let addressed = m.address_libraries(&libs);
+        (libs, r, counts, maps, joined, lazy, addressed)
+    }, move |(libs, r, counts, maps, joined, lazy, addressed)| {
         *me2.joined.borrow_mut() = joined;
+        *me2.addressed.borrow_mut() = addressed;
         // Changed: their cells are asked for again (live).
         *me2.lazy.borrow_mut() = lazy;
         me2.cell_places.borrow_mut().clear();
@@ -440,9 +444,7 @@ fn sidebar(me: &Rc<App>) {
             me2.banner.set_revealed(true);
             *me2.placing.borrow_mut() = Some(u2.clone());
             me2.search.set_text(&u2.address);
-            if retifs_map_core::lookup_allowed() {
-                search(&me2, u2.address.clone());
-            }
+            find(&me2, u2.address.clone(), true);
         });
         me.unplaced_row.add_row(&row);
         me.unplaced_rows.borrow_mut().push(row.upcast());
@@ -605,7 +607,7 @@ fn draw(me: &Rc<App>) {
     load_thumbs(me, &groups);
     // RETIFS_MAP_OPEN=<name>: that place's bubble, once it's on the map (demos).
     if !me.demo_opened.get() {
-        if let Ok(want) = std::env::var("RETIFS_MAP_OPEN") {
+        if let Some(want) = std::env::var("RETIFS_MAP_OPEN").ok().filter(|w| !w.is_empty()) {
             if let Some(p) = visible(me).into_iter().find(|p| p.title.contains(&want)) {
                 me.demo_opened.set(true);
                 let me2 = me.clone();
@@ -832,54 +834,37 @@ fn pin(me: &Rc<App>, lat: f64, lon: f64) {
     me.pin_layer.add_marker(&m);
 }
 
-fn set_online_search(me: &Rc<App>, on: bool) {
-    match retifs_map_core::allow_lookup(on) {
-        Ok(()) => me.search_on.set_state(&on.to_variant()),
-        Err(e) => me.status.set_text(&format!("Not changed: {e}")),
+/// Searches the address libraries joined here (ADR-0027): retifs only, no
+/// internet service. `asked`: Enter was pressed, so "nothing found" is said.
+fn find(me: &Rc<App>, text: String, asked: bool) {
+    let n = me.searches.get() + 1;
+    me.searches.set(n);
+    if asked {
+        me.status.set_text("Searching…");
     }
-}
-
-/// Enter in the search field: asks once before anything is sent out.
-fn ask_search(me: &Rc<App>, text: String) {
-    if text.trim().is_empty() {
-        return;
-    }
-    if retifs_map_core::lookup_allowed() {
-        search(me, text);
-        return;
-    }
-    let d = adw::AlertDialog::builder()
-        .heading("Search addresses in OpenStreetMap?")
-        .body("What you search for is sent to OpenStreetMap's Nominatim service, which also sees this computer's address on the internet. Nothing else leaves this device. You can turn it off again in the menu.")
-        .build();
-    d.add_responses(&[("cancel", "Not now"), ("on", "Turn on")]);
-    d.set_response_appearance("on", adw::ResponseAppearance::Suggested);
-    d.set_default_response(Some("on"));
     let me2 = me.clone();
-    d.connect_response(None, move |_, r| {
-        if r == "on" {
-            set_online_search(&me2, true);
-            search(&me2, text.clone());
+    bg(&me.core, move |m| m.find(&text), move |r| {
+        if me2.searches.get() != n {
+            return; // typed on since
+        }
+        me2.status.set_text("");
+        match r {
+            Ok(found) if asked || !found.is_empty() => show_found(&me2, found),
+            Ok(_) => me2.results_pop.popdown(),
+            Err(e) if asked => me2.status.set_text(&format!("Search failed: {e}")),
+            Err(_) => {}
         }
     });
-    d.present(Some(&me.window));
 }
 
-fn search(me: &Rc<App>, text: String) {
-    me.status.set_text("Searching…");
+/// Search results in the popover under the search field.
+fn show_found(me: &Rc<App>, found: Vec<Found>) {
     let me2 = me.clone();
-    bg(&me.core, move |m| m.lookup(&text), move |r| {
-        me2.status.set_text("");
-        let found = match r {
-            Ok(f) => f,
-            Err(e) => {
-                me2.status.set_text(&format!("Search failed: {e}"));
-                return;
-            }
-        };
+    {
         me2.results.remove_all();
         if found.is_empty() {
-            me2.results.append(&adw::ActionRow::builder().title("Nothing found").build());
+            let row = adw::ActionRow::builder().title("Nothing found").subtitle("in the address libraries joined here").build();
+            me2.results.append(&row);
         }
         for (i, f) in found.iter().enumerate() {
             let (head, rest) = f.name.split_once(", ").unwrap_or((&f.name, ""));
@@ -895,13 +880,13 @@ fn search(me: &Rc<App>, text: String) {
         }
         *me2.found.borrow_mut() = found;
         me2.results_pop.popup();
-    });
+    }
 }
 
 /// A search result picked: the waiting record goes there, or it may be saved.
 fn picked(me: &Rc<App>, f: &Found) {
     me.results_pop.popdown();
-    glide(me, f.lat, f.lon, Some(16.0));
+    glide(me, f.lat, f.lon, Some(f.zoom));
     bubble::close(me);
     pin(me, f.lat, f.lon);
     let head = f.name.split(", ").next().unwrap_or(&f.name).to_string();
@@ -1021,8 +1006,10 @@ fn layers_ui(me: &Rc<App>) {
         if !h.is_empty() {
             what.push(h);
         }
-        // A lazily held library's places come by area: what's been fetched.
-        if me.lazy.borrow().contains(&ns) && map.is_none() {
+        if me.addressed.borrow().contains(&ns) {
+            what.push("addresses: found by the search field".to_string());
+        } else if me.lazy.borrow().contains(&ns) && map.is_none() {
+            // A lazily held library's places come by area: what's been fetched.
             let n: usize = me.cell_places.borrow().iter().filter(|((l, _), _)| *l == ns).map(|(_, p)| p.len()).sum();
             what.push(if n > 0 { format!("{n} places in view so far (fetched by area)") } else { "places come by area: zoom in to 12 or closer".to_string() });
         } else if what.is_empty() && joined.contains(&ns) {
@@ -1196,6 +1183,38 @@ fn square(bytes: &[u8]) -> Option<gdk::Texture> {
     let cut = pb.new_subpixbuf((pb.width() - side) / 2, (pb.height() - side) / 2, side, side);
     let small = cut.scale_simple(MARK * 2, MARK * 2, gtk::gdk_pixbuf::InterpType::Bilinear)?;
     Some(gdk::Texture::for_pixbuf(&small))
+}
+
+/// RETIFS_MAP_SEARCH=<text>: typed into the search field (demos). The
+/// results, which a window snapshot leaves out, go to `<snapshot>-search.png`;
+/// with RETIFS_MAP_PICK set, the first is then picked.
+fn demo_search(me: &Rc<App>) {
+    let Ok(text) = std::env::var("RETIFS_MAP_SEARCH") else { return };
+    let me2 = me.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || me2.search.set_text(&text));
+    let path = std::env::var("RETIFS_MAP_SNAPSHOT").ok().map(|p| p.replace(".png", "-search.png"));
+    let (me2, seen) = (me.clone(), Cell::new(0));
+    glib::timeout_add_seconds_local(2, move || {
+        if !me2.results_pop.is_visible() {
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(path) = &path {
+            let pop = &me2.results_pop;
+            let snapshot = gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(pop)).snapshot(&snapshot, pop.width() as f64, pop.height() as f64);
+            if let (Some(node), Some(renderer)) = (snapshot.to_node(), pop.renderer()) {
+                let _ = renderer.render_texture(&node, None).save_to_png(path);
+            }
+        }
+        seen.set(seen.get() + 1);
+        if seen.get() == 2 && std::env::var_os("RETIFS_MAP_PICK").is_some() {
+            if let Some(f) = me2.found.borrow().first().cloned() {
+                picked(&me2, &f);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// RETIFS_MAP_SNAPSHOT=<file.png>: the window drawn to a file every 2 s.

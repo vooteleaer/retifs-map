@@ -8,8 +8,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use libretifs::{types, AttrValue, Client, RecordView, Request, Response};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub const ME: &str = "me";
+/// Words of an address search sent as terms (the rest are only typed).
+const MAX_FIND_WORDS: usize = 8;
+/// Answers an address search gives.
+const FOUND_MAX: usize = 10;
 /// A place saved for its own sake (ADR-0027).
 pub const PLACE_TYPE: &str = "application/x-vnd.retifs.place";
 
@@ -103,6 +108,10 @@ fn title_of(r: &RecordView) -> String {
 
 /// The places of one record, and what of it has no place yet.
 fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
+    // An address library's streets and towns are searched, not drawn.
+    if text(r, "type").as_deref() == Some(ADDRESS_TYPE) {
+        return (Vec::new(), Vec::new());
+    }
     let kind = Kind::of(&text(r, "type").unwrap_or_default());
     let title = title_of(r);
     let when = text(r, "taken").or_else(|| text(r, "start")).unwrap_or_default();
@@ -219,45 +228,97 @@ pub fn map_uses(l: &libretifs::HeardLibrary) -> bool {
 /// An address search's answer: a suggestion the user may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
-    /// The whole name Nominatim gives ("Kalda, Prangli, Viimsi vald, Harju maakond, Eesti").
+    /// The whole name, most specific first ("Raekoja plats 1, Tallinn").
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    /// How close to show it: a house closer than a street, a street than a town.
+    pub zoom: f64,
 }
 
-fn found(json: &str) -> Result<Vec<Found>, String> {
-    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    Ok(v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| {
-                    let num = |k: &str| r.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
-                    Some(Found { name: r.get("display_name")?.as_str()?.to_string(), lat: num("lat")?, lon: num("lon")? })
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
+/// An address library's records (osm-addresses.py): a street or a settlement
+/// each, listing its houses; searched by the beginnings of their words.
+pub const ADDRESS_TYPE: &str = "application/x-vnd.retifs.address";
 
-/// Whether address search is on: a file in the user's config, set once per device.
-fn lookup_flag() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-    base.join("retifs-map").join("address-search-on")
-}
-
-pub fn lookup_allowed() -> bool {
-    lookup_flag().exists()
-}
-
-pub fn allow_lookup(on: bool) -> std::io::Result<()> {
-    let f = lookup_flag();
-    if on {
-        std::fs::create_dir_all(f.parent().expect("a config dir"))?;
-        std::fs::write(f, b"Address search in OpenStreetMap's Nominatim was turned on here (ADR-0027).\n")
-    } else {
-        std::fs::remove_file(f).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+/// Text as an address search compares it: lower case, no diacritics, words
+/// of letters and digits, in any script (as osm-addresses.py folds it).
+pub fn fold(text: &str) -> Vec<String> {
+    let mut out = String::new();
+    for c in text.nfkd() {
+        if is_combining_mark(c) {
+            continue;
+        }
+        for l in c.to_lowercase() {
+            out.push(if l.is_alphanumeric() { l } else { ' ' });
+        }
     }
+    out.split_whitespace().map(str::to_string).collect()
 }
+
+/// The answers one address record gives to a search: its houses whose
+/// number is `number` (or whose name has one of `words`), else itself. With
+/// a score (higher first).
+fn address_hits(r: &RecordView, words: &[String], number: Option<&str>) -> Vec<(i64, Found)> {
+    let Some(name) = text(r, "name") else { return Vec::new() };
+    let Some((lat, lon)) = r.attrs.iter().find(|(k, _)| k == "geo").and_then(|(_, v)| latlon(v)) else { return Vec::new() };
+    let town = text(r, "in");
+    let street = text(r, "kind").as_deref() == Some("street");
+    let count = r.attrs.iter().find_map(|(k, v)| if let (true, AttrValue::Int(n)) = (k == "count", v) { Some(*n) } else { None }).unwrap_or(0);
+    let full = |head: &str| [Some(head.to_string()), town.clone()].into_iter().flatten().collect::<Vec<_>>().join(", ");
+    // How well the words name it: a word of its own name more than one of its
+    // town's, a whole word more than its beginning.
+    let (own, town_words) = (fold(&name), town.as_deref().map(fold).unwrap_or_default());
+    let name_words: Vec<String> = own.iter().chain(&town_words).cloned().collect();
+    let fit: i64 = words
+        .iter()
+        .map(|w| {
+            if own.contains(w) {
+                20
+            } else if own.iter().any(|o| o.starts_with(w.as_str())) {
+                10
+            } else if town_words.contains(w) {
+                6
+            } else if town_words.iter().any(|t| t.starts_with(w.as_str())) {
+                3
+            } else {
+                0
+            }
+        })
+        .sum();
+    let mut hits = Vec::new();
+    for h in text(r, "houses").unwrap_or_default().split(';') {
+        let mut it = h.split('|');
+        let (Some(label), Some(la), Some(lo)) = (it.next(), it.next(), it.next()) else { continue };
+        let (Ok(la), Ok(lo)) = (la.parse::<f64>(), lo.parse::<f64>()) else { continue };
+        let folded = fold(label).join("");
+        let by_number = number.is_some_and(|n| folded == n);
+        // A farm by its name: the index found it by a whole word; others typed
+        // may be beginnings. Not the words that name the street or town.
+        let by_name = !label.starts_with(|c: char| c.is_ascii_digit())
+            && fold(label).iter().any(|lw| words.iter().any(|w| w.chars().count() >= 2 && !name_words.contains(w) && lw.starts_with(w.as_str())));
+        if by_number || by_name {
+            let head = if street { format!("{name} {label}") } else { format!("{label}, {name}") };
+            // A house by its number first; a farm by its name after the
+            // streets and towns the words name.
+            let base = if by_number { 400 } else { 165 };
+            hits.push((base + fit, Found { name: full(&head), lat: la, lon: lo, zoom: 18.0 }));
+        }
+    }
+    if hits.is_empty() {
+        // The street or settlement itself: a town before a street of its name
+        // when no house number was asked for, bigger ones before smaller.
+        let base = match (number.is_some(), street) {
+            (true, true) => 200,
+            (true, false) => 100,
+            (false, false) => 260,
+            (false, true) => 250,
+        };
+        let size = (count.max(1) as f64).log10() as i64;
+        hits.push((base + fit + size, Found { name: full(&name), lat, lon, zoom: if street { 16.0 } else { 13.0 } }));
+    }
+    hits
+}
+
 
 /// The connection to `retifsd`.
 pub struct Map {
@@ -266,8 +327,9 @@ pub struct Map {
     /// RETIFS_VIA=<node>: every request to that own node over a Link
     /// (ADR-0019): a thin client, nothing kept here.
     via: Option<String>,
-    /// When Nominatim was last asked: at most once a second (its usage policy).
-    last_lookup: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Per library, the keys its index declares searchable: what may be
+    /// asked of it when held lazily (a library of tiles has no `cell`).
+    keys: std::sync::Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl Default for Map {
@@ -280,7 +342,7 @@ impl Map {
     pub fn new() -> Self {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
         let via = std::env::var("RETIFS_VIA").ok().filter(|v| !v.trim().is_empty());
-        Map { rt, store: libretifs::default_store_dir(), via, last_lookup: std::sync::Mutex::new(None) }
+        Map { rt, store: libretifs::default_store_dir(), via, keys: Default::default() }
     }
 
     /// Saves a new place in `ns`; its record ID.
@@ -300,29 +362,37 @@ impl Map {
         }
     }
 
-    /// Looks an address up in OpenStreetMap's Nominatim, if the user turned it on.
-    pub fn lookup(&self, text: &str) -> Result<Vec<Found>, String> {
-        if !lookup_allowed() {
-            return Err("address search is off".into());
+    /// Searches the address libraries joined here (ADR-0027): retifs only,
+    /// no internet service. Words are matched by their beginnings ("raek
+    /// tall"); a word starting with a digit is a house number.
+    pub fn find(&self, text: &str) -> Result<Vec<Found>, String> {
+        let words = fold(text);
+        let (numbers, words): (Vec<String>, Vec<String>) = words.into_iter().partition(|w| w.starts_with(|c: char| c.is_ascii_digit()));
+        let number = numbers.concat();
+        if words.is_empty() {
+            return Ok(Vec::new());
         }
-        {
-            let mut last = self.last_lookup.lock().expect("lookup lock");
-            if let Some(t) = *last {
-                let wait = std::time::Duration::from_secs(1).saturating_sub(t.elapsed());
-                std::thread::sleep(wait);
+        // A blind index answers exact terms (ADR-0019): each word's
+        // beginning is one; the record type keeps others' libraries out.
+        let mut terms = vec![format!("type={ADDRESS_TYPE}")];
+        terms.extend(words.iter().take(MAX_FIND_WORDS).map(|w| format!("find=\"{w}\"")));
+        let mut c = self.client()?;
+        let mut hits: Vec<(i64, Found)> = Vec::new();
+        for ns in self.libraries()? {
+            if !self.searchable(&mut c, &ns, "find") {
+                continue;
             }
-            *last = Some(std::time::Instant::now());
+            let records = match self.call(&mut c, Request::Query { ns: ns.clone(), terms: terms.clone(), at: None }) {
+                Ok(Response::Records { records }) => records,
+                _ => continue,
+            };
+            for r in &records {
+                hits.extend(address_hits(r, &words, (!number.is_empty()).then_some(number.as_str())));
+            }
         }
-        let body = ureq::get("https://nominatim.openstreetmap.org/search")
-            .set("User-Agent", concat!("retifs-map/", env!("CARGO_PKG_VERSION"), " (a retifs demo app)"))
-            .query("q", text)
-            .query("format", "jsonv2")
-            .query("limit", "8")
-            .call()
-            .map_err(|e| e.to_string())?
-            .into_string()
-            .map_err(|e| e.to_string())?;
-        found(&body)
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+        let mut seen = std::collections::HashSet::new();
+        Ok(hits.into_iter().map(|(_, f)| f).filter(|f| seen.insert(f.name.clone())).take(FOUND_MAX).collect())
     }
 
     fn client(&self) -> Result<Client, String> {
@@ -334,6 +404,43 @@ impl Map {
             Response::Error { message } => Err(message),
             r => Ok(r),
         }
+    }
+
+    /// The libraries among these that are searched for addresses (their
+    /// index declares `find`): a gazetteer, not places to draw.
+    pub fn address_libraries(&self, libraries: &[String]) -> Vec<String> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        libraries
+            .iter()
+            .filter(|ns| {
+                self.searchable(&mut c, ns, "find");
+                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "find"))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `key` may be searched for in `ns`: its index declares it, or
+    /// it declares nothing (held whole, searched here). Asked once a library.
+    fn searchable(&self, c: &mut Client, ns: &str, key: &str) -> bool {
+        let known = self.keys.lock().expect("keys lock").get(ns).cloned();
+        let keys = known.unwrap_or_else(|| {
+            let keys: Vec<String> = self
+                .query(c, ns, "type=retifs.index".into())
+                .iter()
+                .flat_map(|r| r.attrs.iter().filter(|(k, _)| k == "keys").flat_map(|(_, v)| match v {
+                    AttrValue::List(l) => l.iter().filter_map(|x| if let AttrValue::Str(s) = x { Some(s.clone()) } else { None }).collect(),
+                    AttrValue::Str(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+                    _ => Vec::new(),
+                }))
+                .collect();
+            // None found may be a failed question: asked again next time.
+            if !keys.is_empty() {
+                self.keys.lock().expect("keys lock").insert(ns.to_string(), keys.clone());
+            }
+            keys
+        });
+        keys.is_empty() || keys.iter().any(|k| k == key)
     }
 
     fn query(&self, c: &mut Client, ns: &str, term: String) -> Vec<RecordView> {
@@ -371,6 +478,10 @@ impl Map {
     /// importer's `cell`): exact terms, which its holder's blind index answers.
     pub fn places_in(&self, ns: &str, cells: &[String]) -> Result<Vec<(String, Vec<Place>)>, String> {
         let mut c = self.client()?;
+        // Places aren't kept by cell there (a map's tiles, addresses): none.
+        if !self.searchable(&mut c, ns, "cell") {
+            return Ok(cells.iter().map(|cell| (cell.clone(), Vec::new())).collect());
+        }
         Ok(cells
             .iter()
             .map(|cell| {
@@ -570,6 +681,66 @@ impl Map {
 }
 
 #[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    fn rec(attrs: &[(&str, AttrValue)]) -> RecordView {
+        RecordView { id: "0".repeat(32), attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(), blocks: Vec::new() }
+    }
+
+    fn street() -> RecordView {
+        let s = |v: &str| AttrValue::Str(v.into());
+        rec(&[
+            ("type", s(ADDRESS_TYPE)),
+            ("kind", s("street")),
+            ("name", s("Raekoja plats")),
+            ("in", s("Tallinn")),
+            ("geo", AttrValue::List(vec![AttrValue::Float(59.4374), AttrValue::Float(24.7457)])),
+            ("houses", s("1|59.437043|24.745316;10A|59.4376|24.7449")),
+            ("count", AttrValue::Int(2)),
+        ])
+    }
+
+    #[test]
+    fn folds_as_the_importer_does() {
+        assert_eq!(fold("Pärnu mnt. 10a, Tõrva-Õue ŽŠ"), vec!["parnu", "mnt", "10a", "torva", "oue", "zs"]);
+        assert_eq!(fold("Нарва, ул. Пушкина 3"), vec!["нарва", "ул", "пушкина", "3"]);
+    }
+
+    #[test]
+    fn a_house_number_finds_the_house_else_the_street() {
+        let w = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let hits = address_hits(&street(), &w(&["raekoja"]), Some("10a"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].1.name.as_str(), hits[0].1.lat, hits[0].1.zoom), ("Raekoja plats 10A, Tallinn", 59.4376, 18.0));
+        let hits = address_hits(&street(), &w(&["raek"]), Some("99"));
+        assert_eq!((hits[0].1.name.as_str(), hits[0].1.zoom), ("Raekoja plats, Tallinn", 16.0));
+        assert!(hits[0].0 < 400, "a street is below a house found");
+    }
+
+    #[test]
+    fn a_farm_is_found_by_its_name() {
+        let s = |v: &str| AttrValue::Str(v.into());
+        let village = rec(&[
+            ("type", s(ADDRESS_TYPE)),
+            ("kind", s("settlement")),
+            ("name", s("Vaida küla")),
+            ("geo", AttrValue::List(vec![AttrValue::Float(59.29), AttrValue::Float(24.97)])),
+            ("houses", s("Kase|59.291|24.971;Mäe-Kõrtsi|59.292|24.972")),
+        ]);
+        let hits = address_hits(&village, &["korts".to_string(), "vaida".to_string()], None);
+        assert_eq!(hits.iter().map(|h| h.1.name.as_str()).collect::<Vec<_>>(), vec!["Mäe-Kõrtsi, Vaida küla"]);
+        let hits = address_hits(&village, &["vaid".to_string()], None);
+        assert_eq!((hits[0].1.name.as_str(), hits[0].1.zoom), ("Vaida küla", 13.0));
+    }
+
+    #[test]
+    fn address_records_are_not_drawn() {
+        assert!(places_of("aadressid", &street()).0.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -616,10 +787,4 @@ mod tests {
         assert!(style.contains(r#""http://kaart.localhost:8740/tiles/{z}/{x}/{y}.pbf""#) && style.contains("https://x/{z}"), "{style}");
     }
 
-    #[test]
-    fn nominatim_answers() {
-        let json = r#"[{"place_id":1,"lat":"59.6236","lon":"25.0061","display_name":"Prangli, Viimsi vald, Harju maakond, Eesti"},{"lat":"x","lon":"1","display_name":"bad"}]"#;
-        assert_eq!(found(json).unwrap(), vec![Found { name: "Prangli, Viimsi vald, Harju maakond, Eesti".into(), lat: 59.6236, lon: 25.0061 }]);
-        assert!(found("[]").unwrap().is_empty());
-    }
 }
