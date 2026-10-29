@@ -234,6 +234,9 @@ pub struct Found {
     pub lon: f64,
     /// How close to show it: a house closer than a street, a street than a town.
     pub zoom: f64,
+    /// A place found (a map's café, one's own photo or contact): picked, its
+    /// bubble opens. None for an address.
+    pub place: Option<Place>,
 }
 
 /// An address library's records (osm-addresses.py): a street or a settlement
@@ -255,6 +258,64 @@ pub fn fold(text: &str) -> Vec<String> {
     out.split_whitespace().map(str::to_string).collect()
 }
 
+/// How well the words name something: a word of its own name more than one
+/// of where it is (its town, its address), a whole word more than its
+/// beginning.
+fn fit(words: &[String], own: &[String], around: &[String]) -> i64 {
+    words
+        .iter()
+        .map(|w| {
+            if own.contains(w) {
+                20
+            } else if own.iter().any(|o| o.starts_with(w.as_str())) {
+                10
+            } else if around.contains(w) {
+                6
+            } else if around.iter().any(|t| t.starts_with(w.as_str())) {
+                3
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+/// A place a search found in a library (a map's café): by its name, what it
+/// is and where.
+fn place_hit(ns: &str, r: &RecordView, words: &[String]) -> Option<(i64, Found)> {
+    let p = places_of(ns, r).0.into_iter().next()?;
+    let address = text(r, "address").unwrap_or_default();
+    let around: Vec<String> = fold(&p.detail).into_iter().chain(fold(&address)).collect();
+    let name = [p.title.clone(), p.detail.clone(), address].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(", ");
+    // Landmarks (shown from further out, ADR-0028) before the everyday.
+    let known = p.minzoom.map_or(0, |z| (18 - z).clamp(0, 8));
+    // Its whole name typed ("raekoda"), not just part of a longer one.
+    let own = fold(&p.title);
+    let whole = if !own.is_empty() && own.iter().all(|o| words.contains(o)) { 15 } else { 0 };
+    Some((240 + fit(words, &own, &around) + known + whole, Found { name, lat: p.lat, lon: p.lon, zoom: 17.0, place: Some(p) }))
+}
+
+/// One's own things already here (photos, contacts, events, saved places)
+/// whose name has every word's beginning: found at once, before the rest.
+pub fn find_here(places: &[Place], text: &str) -> Vec<(i64, Found)> {
+    let words: Vec<String> = fold(text).into_iter().filter(|w| !w.starts_with(|c: char| c.is_ascii_digit())).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    places
+        .iter()
+        .filter(|p| p.minzoom.is_none())
+        .filter_map(|p| {
+            let own = fold(&p.title);
+            let around = fold(&p.label);
+            words.iter().all(|w| own.iter().chain(&around).any(|o| o.starts_with(w.as_str()))).then(|| {
+                let name = if p.label.is_empty() { p.title.clone() } else { format!("{} ({})", p.title, p.label) };
+                (300 + fit(&words, &own, &around), Found { name, lat: p.lat, lon: p.lon, zoom: 17.0, place: Some(p.clone()) })
+            })
+        })
+        .collect()
+}
+
 /// The answers one address record gives to a search: its houses whose
 /// number is `number` (or whose name has one of `words`), else itself. With
 /// a score (higher first).
@@ -265,26 +326,9 @@ fn address_hits(r: &RecordView, words: &[String], number: Option<&str>) -> Vec<(
     let street = text(r, "kind").as_deref() == Some("street");
     let count = r.attrs.iter().find_map(|(k, v)| if let (true, AttrValue::Int(n)) = (k == "count", v) { Some(*n) } else { None }).unwrap_or(0);
     let full = |head: &str| [Some(head.to_string()), town.clone()].into_iter().flatten().collect::<Vec<_>>().join(", ");
-    // How well the words name it: a word of its own name more than one of its
-    // town's, a whole word more than its beginning.
     let (own, town_words) = (fold(&name), town.as_deref().map(fold).unwrap_or_default());
     let name_words: Vec<String> = own.iter().chain(&town_words).cloned().collect();
-    let fit: i64 = words
-        .iter()
-        .map(|w| {
-            if own.contains(w) {
-                20
-            } else if own.iter().any(|o| o.starts_with(w.as_str())) {
-                10
-            } else if town_words.contains(w) {
-                6
-            } else if town_words.iter().any(|t| t.starts_with(w.as_str())) {
-                3
-            } else {
-                0
-            }
-        })
-        .sum();
+    let fit = fit(words, &own, &town_words);
     let mut hits = Vec::new();
     for h in text(r, "houses").unwrap_or_default().split(';') {
         let mut it = h.split('|');
@@ -301,7 +345,7 @@ fn address_hits(r: &RecordView, words: &[String], number: Option<&str>) -> Vec<(
             // A house by its number first; a farm by its name after the
             // streets and towns the words name.
             let base = if by_number { 400 } else { 165 };
-            hits.push((base + fit, Found { name: full(&head), lat: la, lon: lo, zoom: 18.0 }));
+            hits.push((base + fit, Found { name: full(&head), lat: la, lon: lo, zoom: 18.0, place: None }));
         }
     }
     if hits.is_empty() {
@@ -314,7 +358,7 @@ fn address_hits(r: &RecordView, words: &[String], number: Option<&str>) -> Vec<(
             (false, true) => 250,
         };
         let size = (count.max(1) as f64).log10() as i64;
-        hits.push((base + fit + size, Found { name: full(&name), lat, lon, zoom: if street { 16.0 } else { 13.0 } }));
+        hits.push((base + fit + size, Found { name: full(&name), lat, lon, zoom: if street { 16.0 } else { 13.0 }, place: None }));
     }
     hits
 }
@@ -365,7 +409,7 @@ impl Map {
     /// Searches the address libraries joined here (ADR-0027): retifs only,
     /// no internet service. Words are matched by their beginnings ("raek
     /// tall"); a word starting with a digit is a house number.
-    pub fn find(&self, text: &str) -> Result<Vec<Found>, String> {
+    pub fn find(&self, text: &str, here: &[Place]) -> Result<Vec<Found>, String> {
         let words = fold(text);
         let (numbers, words): (Vec<String>, Vec<String>) = words.into_iter().partition(|w| w.starts_with(|c: char| c.is_ascii_digit()));
         let number = numbers.concat();
@@ -373,11 +417,10 @@ impl Map {
             return Ok(Vec::new());
         }
         // A blind index answers exact terms (ADR-0019): each word's
-        // beginning is one; the record type keeps others' libraries out.
-        let mut terms = vec![format!("type={ADDRESS_TYPE}")];
-        terms.extend(words.iter().take(MAX_FIND_WORDS).map(|w| format!("find=\"{w}\"")));
+        // beginning is one. Addresses and places alike.
+        let terms: Vec<String> = words.iter().take(MAX_FIND_WORDS).map(|w| format!("find=\"{w}\"")).collect();
         let mut c = self.client()?;
-        let mut hits: Vec<(i64, Found)> = Vec::new();
+        let mut hits: Vec<(i64, Found)> = find_here(here, text);
         for ns in self.libraries()? {
             if !self.searchable(&mut c, &ns, "find") {
                 continue;
@@ -387,7 +430,11 @@ impl Map {
                 _ => continue,
             };
             for r in &records {
-                hits.extend(address_hits(r, &words, (!number.is_empty()).then_some(number.as_str())));
+                if crate::text(r, "type").as_deref() == Some(ADDRESS_TYPE) {
+                    hits.extend(address_hits(r, &words, (!number.is_empty()).then_some(number.as_str())));
+                } else {
+                    hits.extend(place_hit(&ns, r, &words));
+                }
             }
         }
         hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
@@ -406,15 +453,15 @@ impl Map {
         }
     }
 
-    /// The libraries among these that are searched for addresses (their
-    /// index declares `find`): a gazetteer, not places to draw.
+    /// The libraries among these that are only searched (their index
+    /// declares `find` but no `cell`): a gazetteer, not places to draw.
     pub fn address_libraries(&self, libraries: &[String]) -> Vec<String> {
         let Ok(mut c) = self.client() else { return Vec::new() };
         libraries
             .iter()
             .filter(|ns| {
                 self.searchable(&mut c, ns, "find");
-                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "find"))
+                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "find") && !k.iter().any(|k| k == "cell"))
             })
             .cloned()
             .collect()
@@ -732,6 +779,36 @@ mod find_tests {
         assert_eq!(hits.iter().map(|h| h.1.name.as_str()).collect::<Vec<_>>(), vec!["Mäe-Kõrtsi, Vaida küla"]);
         let hits = address_hits(&village, &["vaid".to_string()], None);
         assert_eq!((hits[0].1.name.as_str(), hits[0].1.zoom), ("Vaida küla", 13.0));
+    }
+
+    #[test]
+    fn places_by_name_what_and_where() {
+        let s = |v: &str| AttrValue::Str(v.into());
+        let cafe = rec(&[
+            ("type", s(PLACE_TYPE)),
+            ("name", s("Werner")),
+            ("category", s("cafe")),
+            ("address", s("Ülikooli 11, Tartu")),
+            ("geo", AttrValue::List(vec![AttrValue::Float(58.38), AttrValue::Float(26.72)])),
+        ]);
+        let (score, f) = place_hit("eesti-kohad", &cafe, &["cafe".to_string(), "tartu".to_string()]).unwrap();
+        assert_eq!((f.name.as_str(), f.zoom, score), ("Werner, cafe, Ülikooli 11, Tartu", 17.0, 252));
+        let mut townhall = cafe.clone();
+        townhall.attrs.push(("minzoom".into(), AttrValue::Int(12)));
+        assert!(place_hit("eesti-kohad", &townhall, &["cafe".to_string(), "tartu".to_string()]).unwrap().0 > score, "a landmark first");
+        assert_eq!(f.place.unwrap().title, "Werner");
+        let one = |w: &str| place_hit("eesti-kohad", &cafe, &[w.to_string()]).unwrap().0;
+        assert!(one("werner") > one("wern") && one("wern") > one("cafe"), "its name counts more than what it is");
+    }
+
+    #[test]
+    fn own_things_are_found_here_first() {
+        let p = |title: &str, minzoom| Place { ns: "me".into(), id: "1".into(), kind: Kind::Person, title: title.into(), label: "home".into(), lat: 59.4, lon: 24.7, when: String::new(), detail: String::new(), minzoom, thumb: None, preview: None };
+        let here = vec![p("Mari Maasikas", None), p("Maarja kohvik", Some(15))];
+        let hits = find_here(&here, "mari maa");
+        assert_eq!(hits.iter().map(|h| h.1.name.as_str()).collect::<Vec<_>>(), vec!["Mari Maasikas (home)"]);
+        assert!(hits[0].0 >= 300, "before what the network finds");
+        assert!(find_here(&here, "jaan").is_empty());
     }
 
     #[test]

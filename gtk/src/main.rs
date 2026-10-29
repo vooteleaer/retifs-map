@@ -664,9 +664,17 @@ fn place_marker(me: &Rc<App>, p: &Place, z: f64) -> shumate::Marker {
     let (me2, p2) = (me.clone(), p.clone());
     dot.connect_clicked(move |_| focus(&me2, &p2, 1));
     if z >= NAMES_FROM {
+        // A marker is centred on its place: an empty space as wide as the
+        // name on the dot's other side keeps the dot there.
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let name = gtk::Label::builder().label(&p.title).css_classes(["caption", "map-name"]).build();
+        let space = gtk::Box::builder().can_target(false).build();
+        let same = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+        same.add_widget(&space);
+        same.add_widget(&name);
+        row.append(&space);
         row.append(&dot);
-        row.append(&gtk::Label::builder().label(&p.title).css_classes(["caption", "map-name"]).build());
+        row.append(&name);
         m.set_child(Some(&row));
     } else {
         m.set_child(Some(&dot));
@@ -843,7 +851,8 @@ fn find(me: &Rc<App>, text: String, asked: bool) {
         me.status.set_text("Searching…");
     }
     let me2 = me.clone();
-    bg(&me.core, move |m| m.find(&text), move |r| {
+    let here = visible(me);
+    bg(&me.core, move |m| m.find(&text, &here), move |r| {
         if me2.searches.get() != n {
             return; // typed on since
         }
@@ -886,6 +895,14 @@ fn show_found(me: &Rc<App>, found: Vec<Found>) {
 /// A search result picked: the waiting record goes there, or it may be saved.
 fn picked(me: &Rc<App>, f: &Found) {
     me.results_pop.popdown();
+    // A place: its bubble, as when it's clicked on the map.
+    if let Some(p) = &f.place {
+        glide(me, p.lat, p.lon, Some(f.zoom.max(me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(0.0))));
+        me.card_box.set_visible(false);
+        me.pin_layer.remove_all();
+        bubble::show(me, p, 1);
+        return;
+    }
     glide(me, f.lat, f.lon, Some(f.zoom));
     bubble::close(me);
     pin(me, f.lat, f.lon);

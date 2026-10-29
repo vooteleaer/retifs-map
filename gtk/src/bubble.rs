@@ -40,8 +40,7 @@ pub fn show(me: &Rc<App>, p: &Place, here: usize) {
     let (ns, id) = (p.ns.clone(), p.id.clone());
     bg(&me.core, move |m| m.details(&ns, &id), move |attrs| {
         fill(&me2, &p2, &body2, &attrs);
-        let me3 = me2.clone();
-        glib::idle_add_local_once(move || place(&me3));
+        settle(&me2, 3);
     });
 
     // The card with a pointer below it, over the map, above its place.
@@ -52,9 +51,19 @@ pub fn show(me: &Rc<App>, p: &Place, here: usize) {
     me.map_overlay.add_overlay(&upper);
     *me.bubble.borrow_mut() = Some((p.lat, p.lon, upper.upcast()));
     place(me);
-    // Its size settles once the details (and a photo) are in.
-    let me2 = me.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || place(&me2));
+    // The map settles once its glide ends (the last move it reports may be before).
+    settle(me, 20);
+}
+
+/// Places the bubble again a few times, 100 ms apart: its size is known
+/// only once laid out, a frame after its content changes.
+fn settle(me: &Rc<App>, times: u32) {
+    let (me2, ticks) = (me.clone(), std::cell::Cell::new(0));
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        place(&me2);
+        ticks.set(ticks.get() + 1);
+        if ticks.get() < times { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+    });
 }
 
 /// Takes the bubble away.
@@ -70,8 +79,15 @@ pub fn place(me: &Rc<App>) {
     let Some((lat, lon, w)) = me.bubble.borrow().clone() else { return };
     let Some(vp) = me.smap.viewport() else { return };
     let (x, y) = vp.location_to_widget_coords(&me.smap, lat, lon);
-    let (_, width, _, _) = w.measure(gtk::Orientation::Horizontal, -1);
-    let (_, height, _, _) = w.measure(gtk::Orientation::Vertical, width);
+    // Its real size once laid out (a measure gives the width its labels
+    // would take unwrapped); before that, as it would be laid out.
+    let (width, height) = if w.width() > 0 {
+        (w.width(), w.height())
+    } else {
+        let (_, width, _, _) = w.measure(gtk::Orientation::Horizontal, -1);
+        let width = width.min(WIDTH + 30);
+        (width, w.measure(gtk::Orientation::Vertical, width).1)
+    };
     let max_x = (me.smap.width() - width).max(0) as f64;
     w.set_margin_start((x - width as f64 / 2.0).clamp(0.0, max_x) as i32);
     w.set_margin_top((y - height as f64 + 4.0).max(0.0) as i32);
@@ -185,8 +201,7 @@ fn photo(me: &Rc<App>, p: &Place, body: &gtk::Box) {
         // size, and a 1600 px picture's would push the bubble off the map.
         if let Some(t) = bytes.and_then(|b| fitted(&b, (WIDTH - 24) * 2, 400)) {
             pic2.set_paintable(Some(&t));
-            let me3 = me4.clone();
-            glib::idle_add_local_once(move || place(&me3));
+            settle(&me4, 3);
         }
     });
     let click = gtk::GestureClick::new();

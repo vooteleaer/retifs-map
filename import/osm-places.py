@@ -8,11 +8,12 @@ shows it, by how much it matters (as OpenStreetMap's own map does).
 
     osmium tags-filter in.osm.pbf nwr/amenity nwr/shop ... -o poi.osm.pbf
     osmium export poi.osm.pbf -f geojsonseq -a type,id | osm-places.py > places.jsonl
-    retifs-map-import places places.jsonl --ns NS
+    retifs-map-import places places.jsonl --ns NS --index cell,type,find
 """
 import json
 import math
 import sys
+import unicodedata
 
 PLACE_TYPE = "application/x-vnd.retifs.place"
 # The tag that says what a place is, in order of preference.
@@ -87,6 +88,25 @@ def clean(v):
     return " ".join(str(v).split())
 
 
+def fold(text):
+    """Lower case, no diacritics, words of letters and digits in any script
+    (as osm-addresses.py and the map's search fold them)."""
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    return "".join(c if c.isalnum() else " " for c in t).split()
+
+
+def find_terms(name, whole):
+    """Search terms (blind-index exact match, ADR-0019): the beginnings of
+    the name's words, from two letters; `whole`'s words as they are (what it
+    is, where: "cafe", "tartu")."""
+    out = set(fold(whole))
+    for w in fold(name):
+        out.add(w)
+        out.update(w[:n] for n in range(2, min(len(w), 12) + 1))
+    return sorted(out)
+
+
 n = 0
 for line in sys.stdin:
     line = line.strip().lstrip("\x1e")
@@ -121,6 +141,7 @@ for line in sys.stdin:
     for k, to in KEEP.items():
         if k in tags and to not in rec:
             rec[to] = clean(tags[k])
+    rec["find"] = find_terms(rec["name"], " ".join([rec["category"], rec.get("address", ""), tags.get("addr:city", "")]))
     print(json.dumps(rec, ensure_ascii=False))
     n += 1
 print(f"{n} places", file=sys.stderr)
