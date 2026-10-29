@@ -7,6 +7,7 @@
 //! updates as the libraries change.
 
 mod announces;
+mod bubble;
 mod icons;
 
 use std::cell::{Cell, RefCell};
@@ -110,6 +111,13 @@ struct App {
     /// When the base map was last drawn (for redrawing as its library changes).
     base_drawn: Cell<std::time::Instant>,
     draw_pending: Cell<bool>,
+    /// The info bubble's own layer (above the markers, not redrawn with them).
+    /// The info bubble: over the map (not a marker: a tall one wasn't drawn),
+    /// kept above its place as the map moves.
+    map_overlay: gtk::Overlay,
+    bubble: RefCell<Option<(f64, f64, gtk::Widget)>>,
+    bubble_opened: Cell<std::time::Instant>,
+    demo_opened: Cell<bool>,
 }
 
 fn build(gapp: &adw::Application) {
@@ -117,7 +125,7 @@ fn build(gapp: &adw::Application) {
     // The map's places: small dots, names on a light label.
     let css = gtk::CssProvider::new();
     css.load_from_string(&(
-        ".map-place { min-width: 20px; min-height: 20px; padding: 2px; border: 1.5px solid white; box-shadow: 0 1px 2px alpha(black, 0.4); }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; } "
+        ".map-place { min-width: 20px; min-height: 20px; padding: 2px; border: 1.5px solid white; box-shadow: 0 1px 2px alpha(black, 0.4); }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; }          .map-bubble { padding: 10px 12px; box-shadow: 0 2px 8px alpha(black, 0.3); }          .map-bubble-photo { border-radius: 6px; }          .map-bubble-arrow { color: @card_bg_color; margin-top: -6px; font-size: 18px; text-shadow: 0 2px 2px alpha(black, 0.2); } "
             .to_string()
             + &icons::css()),
     );
@@ -241,6 +249,10 @@ fn build(gapp: &adw::Application) {
         base_drawn: Cell::new(std::time::Instant::now()),
         no_map_chosen: Cell::new(false),
         draw_pending: Cell::new(false),
+        map_overlay: overlay.clone(),
+        bubble: RefCell::new(None),
+        bubble_opened: Cell::new(std::time::Instant::now()),
+        demo_opened: Cell::new(false),
     });
     {
         let me2 = me.clone();
@@ -296,9 +308,17 @@ fn build(gapp: &adw::Application) {
             }
         });
         let me2 = me.clone();
-        viewport.connect_latitude_notify(move |_| draw_soon(&me2));
+        viewport.connect_latitude_notify(move |_| {
+            bubble::place(&me2);
+            draw_soon(&me2)
+        });
         let me2 = me.clone();
-        viewport.connect_longitude_notify(move |_| draw_soon(&me2));
+        viewport.connect_longitude_notify(move |_| {
+            bubble::place(&me2);
+            draw_soon(&me2)
+        });
+        let me2 = me.clone();
+        viewport.connect_zoom_level_notify(move |_| bubble::place(&me2));
     }
     {
         let me2 = me.clone();
@@ -314,6 +334,10 @@ fn build(gapp: &adw::Application) {
         let click = gtk::GestureClick::new();
         click.connect_released(move |g, _, x, y| {
             if me2.placing.borrow().is_none() && !me2.adding.get() {
+                // Elsewhere on the map: the bubble goes (not the click that opened it).
+                if me2.bubble_opened.get().elapsed() > std::time::Duration::from_millis(400) {
+                    bubble::close(&me2);
+                }
                 return;
             }
             let Some(w) = g.widget() else { return };
@@ -475,6 +499,7 @@ fn ask_cells(me: &Rc<App>, z: f64) {
                     me2.cell_places.borrow_mut().insert((ns.clone(), cell), places);
                 }
                 draw(&me2);
+                layers_ui(&me2);
             }
         });
     }
@@ -538,7 +563,7 @@ fn draw(me: &Rc<App>) {
             }
             _ => {
                 if let Some([w, s, e, n]) = area {
-                    let corners = [(s, w), (n, e)].map(|(lat, lon)| Place { ns: String::new(), id: String::new(), kind: Kind::Other, title: String::new(), label: String::new(), lat, lon, when: String::new(), detail: String::new(), minzoom: None, thumb: None });
+                    let corners = [(s, w), (n, e)].map(|(lat, lon)| Place { ns: String::new(), id: String::new(), kind: Kind::Other, title: String::new(), label: String::new(), lat, lon, when: String::new(), detail: String::new(), minzoom: None, thumb: None, preview: None });
                     fit(me, &corners);
                     me.fitted.set(true);
                 } else if !places.is_empty() {
@@ -578,6 +603,16 @@ fn draw(me: &Rc<App>) {
         me.layer.add_marker(&marker(me, g));
     }
     load_thumbs(me, &groups);
+    // RETIFS_MAP_OPEN=<name>: that place's bubble, once it's on the map (demos).
+    if !me.demo_opened.get() {
+        if let Ok(want) = std::env::var("RETIFS_MAP_OPEN") {
+            if let Some(p) = visible(me).into_iter().find(|p| p.title.contains(&want)) {
+                me.demo_opened.set(true);
+                let me2 = me.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || focus(&me2, &p, 1));
+            }
+        }
+    }
 }
 
 /// Places closer than this (pixels) to one already shown are left out.
@@ -695,19 +730,29 @@ fn open(me: &Rc<App>, members: &[Place]) {
     focus(me, &members[0], members.len());
 }
 
-/// Shows a place's card and centres on it.
+/// Shows a place's info bubble and glides the map to it.
 fn focus(me: &Rc<App>, p: &Place, here: usize) {
-    let title = if here > 1 { format!("{} and {} more here", p.title, here - 1) } else { p.title.clone() };
-    me.card.set_title(&glib::markup_escape_text(&title));
-    let label = if p.label.is_empty() { String::new() } else { format!(" ({})", p.label) };
-    let when = if p.when.is_empty() { String::new() } else { format!(" · {}", p.when.replace('T', " ")) };
-    me.card.set_subtitle(&glib::markup_escape_text(&format!("{}{label} · {} · {:.5}, {:.5}{when}", if p.detail.is_empty() { kind_name(p.kind) } else { p.detail.as_str() }, p.ns, p.lat, p.lon)));
-    me.card_button.set_visible(false);
+    me.card_box.set_visible(false);
     *me.card_action.borrow_mut() = None;
     me.pin_layer.remove_all();
-    me.card_box.set_visible(true);
-    if let Some(map) = me.smap.map() {
-        map.center_on(p.lat, p.lon);
+    bubble::show(me, p, here);
+    glide(me, p.lat, p.lon, None);
+}
+
+/// Moves the map there smoothly (and to `zoom`, if given); without a map
+/// shown (the blank style) libshumate can't animate, so it just goes.
+fn glide(me: &Rc<App>, lat: f64, lon: f64, zoom: Option<f64>) {
+    let Some(map) = me.smap.map() else { return };
+    let real = me.base.borrow().as_deref().is_some_and(|b| !b.is_empty());
+    match (real, zoom) {
+        (true, Some(z)) => map.go_to_full(lat, lon, z),
+        (true, None) => map.go_to(lat, lon),
+        (false, z) => {
+            if let (Some(z), Some(vp)) = (z, me.smap.viewport()) {
+                vp.set_zoom_level(z);
+            }
+            map.center_on(lat, lon);
+        }
     }
 }
 
@@ -722,9 +767,14 @@ fn fit(me: &Rc<App>, places: &[Place]) {
     }
     let span = (lat1 - lat0).max(lon1 - lon0).max(0.002);
     let zoom = ((360.0 / span).log2() - 0.5).clamp(2.0, 18.0);
-    if let (Some(map), Some(vp)) = (me.smap.map(), me.smap.viewport()) {
-        vp.set_zoom_level(zoom);
-        map.center_on((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0);
+    if let Some(map) = me.smap.map() {
+        // Gliding there, except the first time (nothing to glide from).
+        if me.fitted.get() {
+            glide(me, (lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0, Some(zoom));
+        } else if let Some(vp) = me.smap.viewport() {
+            vp.set_zoom_level(zoom);
+            map.center_on((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0);
+        }
     }
 }
 
@@ -851,10 +901,8 @@ fn search(me: &Rc<App>, text: String) {
 /// A search result picked: the waiting record goes there, or it may be saved.
 fn picked(me: &Rc<App>, f: &Found) {
     me.results_pop.popdown();
-    if let (Some(map), Some(vp)) = (me.smap.map(), me.smap.viewport()) {
-        vp.set_zoom_level(16.0);
-        map.center_on(f.lat, f.lon);
-    }
+    glide(me, f.lat, f.lon, Some(16.0));
+    bubble::close(me);
     pin(me, f.lat, f.lon);
     let head = f.name.split(", ").next().unwrap_or(&f.name).to_string();
     let waiting = me.placing.borrow().clone();
@@ -974,7 +1022,7 @@ fn layers_ui(me: &Rc<App>) {
             what.push(h);
         }
         // A lazily held library's places come by area: what's been fetched.
-        if me.lazy.borrow().contains(&ns) {
+        if me.lazy.borrow().contains(&ns) && map.is_none() {
             let n: usize = me.cell_places.borrow().iter().filter(|((l, _), _)| *l == ns).map(|(_, p)| p.len()).sum();
             what.push(if n > 0 { format!("{n} places in view so far (fetched by area)") } else { "places come by area: zoom in to 12 or closer".to_string() });
         } else if what.is_empty() && joined.contains(&ns) {

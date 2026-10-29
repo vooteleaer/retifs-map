@@ -56,6 +56,8 @@ pub struct Place {
     pub minzoom: Option<i64>,
     /// The first content block's read-cap (a photo), and its thumbnail's.
     pub thumb: Option<String>,
+    /// A photo's larger preview block (1600 px, the extractor's), if it has one.
+    pub preview: Option<String>,
 }
 
 /// A record with an address or a location but no coordinates for it.
@@ -109,13 +111,21 @@ fn places_of(ns: &str, r: &RecordView) -> (Vec<Place>, Vec<Unplaced>) {
         _ => None,
     });
     let thumb = (kind == Kind::Photo).then(|| thumb_index.and_then(|i| r.blocks.get(i)).or(r.blocks.first()).cloned()).flatten();
+    let preview = (kind == Kind::Photo)
+        .then(|| {
+            r.attrs.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                ("block:preview", AttrValue::Int(i)) if *i > 0 => r.blocks.get(*i as usize).cloned(),
+                _ => None,
+            })
+        })
+        .flatten();
     let detail = text(r, "category").map(|c| c.replace('_', " ")).unwrap_or_default();
     let minzoom = r.attrs.iter().find(|(k, _)| k == "minzoom").and_then(|(_, v)| if let AttrValue::Int(i) = v { Some(*i) } else { None });
     let mut placed = Vec::new();
     for (k, v) in &r.attrs {
         let label = if k == "geo" { "" } else if let Some(l) = k.strip_prefix("geo:") { l } else { continue };
         if let Some((lat, lon)) = latlon(v) {
-            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), detail: detail.clone(), minzoom, thumb: thumb.clone() });
+            placed.push(Place { ns: ns.into(), id: r.id.clone(), kind, title: title.clone(), label: label.into(), lat, lon, when: when.clone(), detail: detail.clone(), minzoom, thumb: thumb.clone(), preview: preview.clone() });
         }
     }
     // Addresses (contacts) and locations (events) without coordinates.
@@ -507,15 +517,43 @@ impl Map {
 
     /// A small image of a photo (its thumbnail block), at most 2 MB.
     pub fn thumb(&self, p: &Place) -> Option<Vec<u8>> {
-        let cap = p.thumb.clone()?;
+        self.image(&p.ns, p.thumb.as_ref()?, 2 << 20)
+    }
+
+    /// A block's bytes (an image), if it's no bigger than `max`.
+    pub fn image(&self, ns: &str, cap: &str, max: u64) -> Option<Vec<u8>> {
         let size: u64 = cap.rsplit(':').next()?.parse().ok()?;
-        if size > 2 << 20 {
+        if size > max {
             return None;
         }
         let mut c = self.client().ok()?;
-        match self.call(&mut c, Request::ReadRange { cap, ns: Some(p.ns.clone()), offset: 0, len: size, wait_ms: 30_000 }) {
+        match self.call(&mut c, Request::ReadRange { cap: cap.to_string(), ns: Some(ns.to_string()), offset: 0, len: size, wait_ms: 30_000 }) {
             Ok(Response::Range { data }) => Some(data),
             _ => None,
+        }
+    }
+
+    /// A record's attributes as text, for an info bubble.
+    pub fn details(&self, ns: &str, id: &str) -> Vec<(String, String)> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        let text = |v: &AttrValue| -> String {
+            match v {
+                AttrValue::Str(s) => s.clone(),
+                AttrValue::Int(i) => i.to_string(),
+                AttrValue::Float(f) => format!("{f}"),
+                AttrValue::Bool(b) => b.to_string(),
+                AttrValue::List(l) => l.iter().map(|x| match x {
+                    AttrValue::Str(s) => s.clone(),
+                    AttrValue::Float(f) => format!("{f}"),
+                    AttrValue::Int(i) => i.to_string(),
+                    other => format!("{other:?}"),
+                }).collect::<Vec<_>>().join(", "),
+                other => format!("{other:?}"),
+            }
+        };
+        match self.call(&mut c, Request::RecordGet { ns: ns.into(), id: id.into() }) {
+            Ok(Response::Records { records }) => records.first().map(|r| r.attrs.iter().map(|(k, v)| (k.clone(), text(v))).collect()).unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 
