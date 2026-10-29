@@ -512,8 +512,9 @@ fn groups(places: Vec<Place>, z: f64) -> Vec<Group> {
 
 fn draw(me: &Rc<App>) {
     let places = visible(me);
-    if !me.fitted.get() && !places.is_empty() {
-        me.fitted.set(true);
+    if !me.fitted.get() {
+        // RETIFS_MAP_VIEW=lat,lon,zoom: where to open instead (demos).
+        let view: Option<Vec<f64>> = std::env::var("RETIFS_MAP_VIEW").ok().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
         // Around the user's own things: the map's places (a country's cafés)
         // and libraries of thousands would show the whole country.
         let mut per_lib: HashMap<&str, usize> = HashMap::new();
@@ -521,14 +522,30 @@ fn draw(me: &Rc<App>) {
             *per_lib.entry(p.ns.as_str()).or_default() += 1;
         }
         let own: Vec<Place> = places.iter().filter(|p| p.minzoom.is_none() && per_lib[p.ns.as_str()] <= FIT_MAX).cloned().collect();
-        // RETIFS_MAP_VIEW=lat,lon,zoom: where to open instead (demos).
-        let view: Option<Vec<f64>> = std::env::var("RETIFS_MAP_VIEW").ok().map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+        // Nothing of one's own (a storage-less node: places come by cell only
+        // once zoomed in): the shown map's area.
+        let shown = me.base.borrow().clone().unwrap_or_default();
+        let area = me.tilesets.borrow().iter().find(|t| t.id == shown).and_then(|t| t.bounds);
         match (view.as_deref(), me.smap.map(), me.smap.viewport()) {
             (Some([lat, lon, z]), Some(map), Some(vp)) => {
                 vp.set_zoom_level(*z);
                 map.center_on(*lat, *lon);
+                me.fitted.set(true);
             }
-            _ => fit(me, if own.is_empty() { &places } else { &own }),
+            _ if !own.is_empty() => {
+                fit(me, &own);
+                me.fitted.set(true);
+            }
+            _ => {
+                if let Some([w, s, e, n]) = area {
+                    let corners = [(s, w), (n, e)].map(|(lat, lon)| Place { ns: String::new(), id: String::new(), kind: Kind::Other, title: String::new(), label: String::new(), lat, lon, when: String::new(), detail: String::new(), minzoom: None, thumb: None });
+                    fit(me, &corners);
+                    me.fitted.set(true);
+                } else if !places.is_empty() {
+                    fit(me, &places);
+                    me.fitted.set(true);
+                }
+            }
         }
     }
     let z = me.smap.viewport().map(|v| v.zoom_level()).unwrap_or(10.0).round();
@@ -956,7 +973,11 @@ fn layers_ui(me: &Rc<App>) {
         if !h.is_empty() {
             what.push(h);
         }
-        if what.is_empty() && joined.contains(&ns) {
+        // A lazily held library's places come by area: what's been fetched.
+        if me.lazy.borrow().contains(&ns) {
+            let n: usize = me.cell_places.borrow().iter().filter(|((l, _), _)| *l == ns).map(|(_, p)| p.len()).sum();
+            what.push(if n > 0 { format!("{n} places in view so far (fetched by area)") } else { "places come by area: zoom in to 12 or closer".to_string() });
+        } else if what.is_empty() && joined.contains(&ns) {
             what.push("joined: nothing here yet, it fills in from the network".to_string());
         }
         let ns2 = ns.clone();
