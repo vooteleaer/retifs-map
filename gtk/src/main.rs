@@ -76,6 +76,10 @@ struct App {
     libraries: RefCell<Vec<String>>,
     counts: RefCell<HashMap<String, u64>>,
     status: gtk::Label,
+    /// "Reading libraries…" while they're read.
+    reading: gtk::ProgressBar,
+    /// Each library's view (records, peers, kept here), for its row.
+    infos: RefCell<HashMap<String, libretifs::NsView>>,
     fitted: Cell<bool>,
     zoom: Cell<i32>,
     window: adw::ApplicationWindow,
@@ -151,6 +155,11 @@ fn build(gapp: &adw::Application) {
     // Wrapped and narrow: a long message mustn't widen the sidebar.
     let status = gtk::Label::builder().xalign(0.0).margin_start(12).margin_end(12).margin_bottom(8).wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).max_width_chars(36).css_classes(["dim-label", "caption"]).build();
     let side_inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(24).margin_start(12).margin_end(12).margin_top(12).margin_bottom(12).build();
+    // The shared layout: Announces above the libraries, a bar while reading.
+    let announces = gtk::Button::builder().label("Announces").tooltip_text("Public libraries heard on the network").build();
+    let reading = gtk::ProgressBar::builder().text("Reading libraries…").show_text(true).visible(false).build();
+    side_inner.append(&announces);
+    side_inner.append(&reading);
     side_inner.append(&layers_group);
     side_inner.append(&unplaced_group);
     let side_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -182,9 +191,6 @@ fn build(gapp: &adw::Application) {
     let add = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Add a place").build();
     let header = adw::HeaderBar::builder().title_widget(&search).build();
     header.pack_start(&add);
-    // Public libraries heard on the network, as LXMF apps list announces (ADR-0029).
-    let announces = gtk::Button::builder().label("Announces").tooltip_text("Public libraries heard on the network").build();
-    header.pack_end(&announces);
 
     let banner = adw::Banner::builder().button_label("Cancel").revealed(false).build();
     let card = adw::ActionRow::builder().build();
@@ -224,6 +230,8 @@ fn build(gapp: &adw::Application) {
         libraries: RefCell::new(Vec::new()),
         counts: RefCell::new(HashMap::new()),
         status,
+        reading: reading.clone(),
+        infos: RefCell::new(HashMap::new()),
         fitted: Cell::new(false),
         zoom: Cell::new(-1),
         window: window.clone(),
@@ -388,6 +396,19 @@ fn build(gapp: &adw::Application) {
 
 fn reload(me: &Rc<App>) {
     let me2 = me.clone();
+    me.reading.set_visible(true);
+    me.reading.pulse();
+    let pulse = {
+        let bar = me.reading.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
+            if !bar.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            bar.pulse();
+            glib::ControlFlow::Continue
+        })
+    };
+    let pulse = RefCell::new(Some(pulse));
     bg(&me.core, |m| {
         let libs = m.libraries().unwrap_or_default();
         // Lazily held libraries aren't asked for all their places at once.
@@ -398,8 +419,14 @@ fn reload(me: &Rc<App>) {
         let maps = m.tilesets(&libs);
         let joined = m.joined(&libs);
         let addressed = m.address_libraries(&libs);
-        (libs, r, counts, maps, joined, lazy, addressed)
-    }, move |(libs, r, counts, maps, joined, lazy, addressed)| {
+        let infos: HashMap<String, libretifs::NsView> = libs.iter().filter_map(|n| m.info(n).ok().map(|v| (n.clone(), v))).collect();
+        (libs, r, counts, maps, joined, lazy, addressed, infos)
+    }, move |(libs, r, counts, maps, joined, lazy, addressed, infos)| {
+        me2.reading.set_visible(false);
+        if let Some(p) = pulse.borrow_mut().take() {
+            p.remove();
+        }
+        *me2.infos.borrow_mut() = infos;
         *me2.joined.borrow_mut() = joined;
         *me2.addressed.borrow_mut() = addressed;
         // Changed: their cells are asked for again (live).
@@ -429,7 +456,7 @@ fn sidebar(me: &Rc<App>) {
         me.unplaced_row.remove(&w);
     }
     let unplaced = me.unplaced.borrow();
-    me.unplaced_group.set_visible(!unplaced.is_empty());
+    me.unplaced_group.set_visible(false);
     me.unplaced_row.set_title(&format!("{} waiting", unplaced.len()));
     if unplaced.len() > UNPLACED_SHOWN {
         me.unplaced_row.set_subtitle(&format!("the first {UNPLACED_SHOWN} shown"));
@@ -1032,8 +1059,25 @@ fn layers_ui(me: &Rc<App>) {
         } else if what.is_empty() && joined.contains(&ns) {
             what.push("joined: nothing here yet, it fills in from the network".to_string());
         }
+        if let Some(v) = me.infos.borrow().get(&ns) {
+            let here = if v.lazy { "fetched as needed" } else if v.keep == "all" { "kept on this device" } else { "content fetched as needed" };
+            what.push(format!("{} records · {} peers · {here}", v.records, v.peers));
+            if v.coming() {
+                what.push(match v.kept_here {
+                    Some(h) if v.kept > 0 => format!("fetching {h} of {} files…", v.kept),
+                    _ => "fetching its records…".to_string(),
+                });
+            }
+        }
         let ns2 = ns.clone();
         let row = adw::SwitchRow::builder().title(glib::markup_escape_text(&ns)).subtitle(glib::markup_escape_text(&what.join(" · "))).active(!me.hidden.borrow().contains(&ns)).build();
+        // Right-click: what can be done with it.
+        let click = gtk::GestureClick::builder().button(3).build();
+        {
+            let (me2, ns3, row2) = (me.clone(), ns.clone(), row.clone());
+            click.connect_pressed(move |_, _, x, y| library_menu(&me2, &ns3, &row2, x, y));
+        }
+        row.add_controller(click);
         let (me2, maps2) = (me.clone(), maps.clone());
         row.connect_active_notify(move |r| {
             if r.is_active() {
@@ -1066,6 +1110,49 @@ fn layers_ui(me: &Rc<App>) {
         me.layers_group.add(&row);
         me.layer_rows.borrow_mut().push(row.upcast());
     }
+}
+
+/// A library's right-click menu: keep it on this device or not, leave it.
+fn library_menu(me: &Rc<App>, ns: &str, row: &adw::SwitchRow, x: f64, y: f64) {
+    let kept = me.infos.borrow().get(ns).is_some_and(|v| !v.lazy && v.keep == "all");
+    let joined = me.joined.borrow().iter().any(|n| n == ns);
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let pop = gtk::Popover::builder().child(&menu).has_arrow(false).build();
+    pop.set_parent(row);
+    pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let item = |label: &str| {
+        let b = gtk::Button::builder().label(label).css_classes(["flat"]).build();
+        b.child().and_downcast::<gtk::Label>().map(|l| l.set_xalign(0.0));
+        menu.append(&b);
+        b
+    };
+    let keep = item(if kept { "Fetch as needed only" } else { "Keep on this device" });
+    {
+        let (me2, ns2, pop2) = (me.clone(), ns.to_string(), pop.clone());
+        keep.connect_clicked(move |_| {
+            pop2.popdown();
+            let (me3, ns3) = (me2.clone(), ns2.clone());
+            bg(&me2.core, move |m| m.keep(&ns3, !kept), move |r| {
+                if let Err(e) = r {
+                    me3.status.set_text(&format!("Not changed: {e}"));
+                }
+                reload(&me3);
+            });
+        });
+    }
+    if joined {
+        let leave = item("Leave library…");
+        let (me2, ns2, pop2) = (me.clone(), ns.to_string(), pop.clone());
+        leave.connect_clicked(move |_| {
+            pop2.popdown();
+            leave_dialog(&me2, &ns2);
+        });
+    }
+    pop.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    pop.popup();
 }
 
 /// Leaves a joined library, after asking: it's gone from this device, others
