@@ -38,6 +38,9 @@ uint8_t* rm_tile(const char* tileset, int z, int x, int y, size_t* len);
 uint8_t* rm_thumb(int place, size_t* len);
 /* A photo's larger preview (else its thumbnail), as image bytes. */
 uint8_t* rm_preview(int place, size_t* len);
+/* A place's icon by its category, size×size, white B_RGBA32 (freed with
+ * rm_free_bytes(p, size*size*4)); *color its circle's colour, 0xRRGGBB. */
+uint8_t* rm_icon(const char* category, int size, uint32_t* color);
 char* rm_details(const char* ns, const char* id);
 char* rm_find(const char* text);
 char* rm_save_place(const char* ns, const char* name, double lat, double lon,

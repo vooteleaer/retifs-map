@@ -587,15 +587,12 @@ public:
 				fTarget.SendMessage(&start);
 				if (list.HasString("error"))
 					break;
-				BMessage libraries, lazy, address;
+				BMessage libraries, lazy;
 				list.FindMessage("libraries", &libraries);
 				list.FindMessage("lazy", &lazy);
-				list.FindMessage("address", &address);
-				std::set<BString> lazySet, skip;
+				std::set<BString> lazySet;
 				for (int32 i = 0; i < Count(lazy); i++)
 					lazySet.insert(_Name(lazy, i));
-				for (int32 i = 0; i < Count(address); i++)
-					skip.insert(_Name(address, i));
 				int32 total = Count(libraries);
 				for (int32 i = 0; i < total; i++) {
 					BString ns = _Name(libraries, i);
@@ -604,9 +601,6 @@ public:
 					step.AddInt32("i", i);
 					step.AddInt32("total", total);
 					fTarget.SendMessage(&step);
-					// A gazetteer is only searched.
-					if (skip.find(ns) != skip.end())
-						continue;
 					BMessage one(kLoadLibrary);
 					one.AddMessage("data", new BMessage(Take(rm_library(ns.String(),
 						lazySet.find(ns) != lazySet.end() ? 1 : 0))));
@@ -1171,6 +1165,8 @@ public:
 		_Clear();
 		for (auto& t : fThumbs)
 			delete t.second;
+		for (auto& i : fIcons)
+			delete i.second.bitmap;
 	}
 
 	/*! Shows the bubble of the place with this number, if it's loaded. */
@@ -1900,12 +1896,24 @@ private:
 				DrawBitmap(thumb, thumb->Bounds(), frame.InsetByCopy(1, 1));
 				SetDrawingMode(B_OP_ALPHA);
 			} else {
+				// A place with a category (a map's café): its icon, on its
+				// group's colour; else the kind's colour and glyph.
+				const Icon* icon = NULL;
+				if (g.kind == "place" && !g.members[0]->detail.IsEmpty())
+					icon = _Icon(g.members[0]->detail);
 				SetHighColor(0, 0, 0, 60);
 				FillEllipse(c + BPoint(0, 1.5), r + 1, r + 1);
 				SetHighColor(255, 255, 255);
 				FillEllipse(c, r + 1.5, r + 1.5);
-				SetHighColor(KindColor(g.kind));
+				SetHighColor(icon != NULL ? icon->color : KindColor(g.kind));
 				FillEllipse(c, r, r);
+			}
+			if (thumb == NULL && g.kind == "place" && !g.members[0]->detail.IsEmpty()
+				&& _Icon(g.members[0]->detail) != NULL) {
+				const Icon* icon = _Icon(g.members[0]->detail);
+				BRect i = icon->bitmap->Bounds();
+				DrawBitmap(icon->bitmap, c - BPoint(i.Width() / 2, i.Height() / 2));
+			} else if (thumb == NULL) {
 				font.SetSize(13);
 				SetFont(&font);
 				SetHighColor(255, 255, 255);
@@ -2005,6 +2013,31 @@ private:
 	std::vector<TileWorker*> fWorkers;
 	std::vector<Place> fPlaces;
 	std::set<BString> fHidden;
+	struct Icon {
+		BBitmap* bitmap;
+		rgb_color color;
+	};
+
+	/*! A category's icon (made once, kept). */
+	const Icon* _Icon(const BString& category)
+	{
+		auto it = fIcons.find(category);
+		if (it != fIcons.end())
+			return it->second.bitmap != NULL ? &it->second : NULL;
+		const int size = 18;
+		uint32 rgb = 0x6b6b6b;
+		uint8* pixels = rm_icon(category.String(), size, &rgb);
+		Icon icon = { NULL, make_color(rgb >> 16, (rgb >> 8) & 0xff, rgb & 0xff) };
+		if (pixels != NULL) {
+			icon.bitmap = new BBitmap(BRect(0, 0, size - 1, size - 1), B_RGBA32);
+			icon.bitmap->SetBits(pixels, size * size * 4, 0, B_RGBA32);
+			rm_free_bytes(pixels, size * size * 4);
+		}
+		fIcons[category] = icon;
+		return icon.bitmap != NULL ? &fIcons[category] : NULL;
+	}
+
+	std::map<BString, Icon> fIcons;
 	std::map<int32, BBitmap*> fThumbs;
 	std::set<int32> fThumbAsked;
 	std::vector<Hit> fHits;
@@ -2303,6 +2336,10 @@ public:
 
 		fWorker = new Worker(BMessenger(this));
 		fWorker->Run();
+		// Styles, searches and places by area on a worker of their own: not
+		// behind a slow library's reading.
+		fQuick = new Worker(BMessenger(this));
+		fQuick->Run();
 		fWorker->PostMessage(kLoad);
 		BMessage changes(kChanges);
 		fRunner = new BMessageRunner(BMessenger(fWorker), &changes, 5000000);
@@ -2313,6 +2350,8 @@ public:
 		delete fRunner;
 		fWorker->Lock();
 		fWorker->Quit();
+		fQuick->Lock();
+		fQuick->Quit();
 	}
 
 	/*! The zoom button puts the window over the whole screen (its tab and
@@ -2467,7 +2506,7 @@ public:
 					break;
 				BMessage find(kFind);
 				find.AddString("text", text);
-				fWorker->PostMessage(&find);
+				fQuick->PostMessage(&find);
 				fStatus->SetText(BString("Searching ") << text << "…");
 				break;
 			}
@@ -2632,6 +2671,9 @@ private:
 	void _AddLibrary(const BMessage& data)
 	{
 		BString ns = data.GetString("ns", "");
+		// A gazetteer is only searched: not listed.
+		if (data.GetBool("address", false))
+			return;
 		BMessage tilesets, places;
 		data.FindMessage("tilesets", &tilesets);
 		data.FindMessage("places", &places);
@@ -2691,7 +2733,7 @@ private:
 			ask.AddDouble("e", e);
 			ask.AddDouble("n", n);
 			ask.AddInt32("zoom", zoom);
-			fWorker->PostMessage(&ask);
+			fQuick->PostMessage(&ask);
 		}
 	}
 
@@ -2830,7 +2872,7 @@ private:
 		}
 		BMessage style(kStyle);
 		style.AddString("map", id);
-		fWorker->PostMessage(&style);
+		fQuick->PostMessage(&style);
 	}
 
 	MapView* fMap;
@@ -2854,6 +2896,7 @@ private:
 	BString fShownMap;
 	bool fFitted;
 	Worker* fWorker;
+	Worker* fQuick;
 	BMessageRunner* fRunner;
 };
 

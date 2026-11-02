@@ -19,7 +19,8 @@ The map with the Haiku API, over the shared core (`../core`) as a C library
   markers that would overlap are pushed apart.
 - The search field (Enter) finds addresses and places; picking one goes
   there. A lazy library's places (a map's cafés) are asked for by area from
-  zoom 12.
+  zoom 12, each with its category's icon (Maki, the same set and colours as
+  the GTK app's, from the core; drawn by resvg in the C library).
 
 ## Building, on Haiku
 
@@ -33,5 +34,4 @@ with retifs next to retifs-map. The result is `haiku/build/Map` and the
 - Several maps over each other, each with its own opacity (a slider per map
   library): each map's tiles drawn into bitmaps of their own, composed with
   B_OP_ALPHA at a constant alpha.
-- Adding and placing a place; a map's public places (cafés) with their
-  category icons (Maki).
+- Adding and placing a place.

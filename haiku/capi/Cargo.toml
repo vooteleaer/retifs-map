@@ -13,3 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 retifs-map-core = { path = "../../core" }
 serde_json = "1"
+# The place icons (SVG) drawn here, for the BeAPI (no SVG of its own); no text in them.
+resvg = { version = "0.45.1", default-features = false }

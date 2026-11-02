@@ -21,6 +21,19 @@ mod tests {
         // Tallinn (24.75, 59.44) is in tile 8/145/75.
         assert!(w < 24.75 && 24.75 < e && s < 59.44 && 59.44 < n, "{w} {n} {e} {s}");
     }
+
+    #[test]
+    fn a_cafe_has_its_icon() {
+        let mut color = 0u32;
+        let name = std::ffi::CString::new("cafe").unwrap();
+        let p = unsafe { super::rm_icon(name.as_ptr(), 24, &mut color) };
+        assert!(!p.is_null());
+        let pixels = unsafe { std::slice::from_raw_parts(p, 24 * 24 * 4) };
+        assert!(pixels.chunks(4).any(|px| px[3] > 128), "something drawn");
+        assert!(pixels.chunks(4).any(|px| px[3] == 0), "on transparent");
+        assert_eq!(color, 0xc77400);
+        unsafe { super::rm_free_bytes(p, 24 * 24 * 4) };
+    }
 }
 
 use retifs_map_core::vector::{self, Style};
@@ -41,9 +54,14 @@ struct State {
     tile_order: VecDeque<(String, u32, u32, u32)>,
 }
 
+/// The Map of the calling thread: a Map's calls run one at a time, so the
+/// app's workers (reading libraries, searching, drawing) each have their own
+/// and a slow library doesn't hold up a search.
 fn map() -> &'static Map {
-    static MAP: OnceLock<Map> = OnceLock::new();
-    MAP.get_or_init(Map::new)
+    thread_local! {
+        static MAP: &'static Map = Box::leak(Box::new(Map::new()));
+    }
+    MAP.with(|m| *m)
 }
 
 thread_local! {
@@ -151,23 +169,27 @@ pub extern "C" fn rm_libraries() -> *mut c_char {
         Err(e) => return out(json!({ "error": e })),
     };
     let lazy = m.lazy(&libraries);
-    let address = m.address_libraries(&libraries);
     let mut s = state();
     s.libraries = libraries.clone();
     s.tilesets.clear();
     s.places.clear();
-    out(json!({ "libraries": libraries, "lazy": lazy, "address": address }))
+    out(json!({ "libraries": libraries, "lazy": lazy }))
 }
 
 /// One library read: `{"ns", "tilesets": […], "places": […], "unplaced": […],
 /// "by_cell"}` (as in `rm_load`; "by_cell": held lazily, with places asked
-/// for by area). Its places and maps are added to those kept.
+/// for by area), or `{"ns", "address": true}` for an address library (only
+/// searched). Its places and maps are added to those kept.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rm_library(ns: *const c_char, lazy: c_int) -> *mut c_char {
     let ns = unsafe { arg(ns) };
     let m = map();
     let one = [ns.clone()];
     let tilesets = m.tilesets(&one);
+    // A gazetteer (addresses) is only searched: nothing of it to show.
+    if !m.address_libraries(&one).is_empty() {
+        return out(json!({ "ns": ns, "address": true }));
+    }
     let by_cell = lazy != 0 && !m.place_libraries(&one).is_empty();
     let (places, unplaced) = if lazy != 0 { Default::default() } else { m.places(&one).unwrap_or_default() };
     let info = m.info(&ns).ok();
@@ -323,6 +345,30 @@ pub unsafe extern "C" fn rm_preview(i: c_int, len: *mut usize) -> *mut u8 {
         Some(b) => bytes(b, len),
         None => std::ptr::null_mut(),
     }
+}
+
+/// A place's icon by its category (a map's café: `cafe`), `size` pixels
+/// square: white on transparent, B_RGBA32 (B, G, R, A), or null. `*color`
+/// gets its circle's colour (0xRRGGBB). Freed with `rm_free_bytes`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rm_icon(category: *const c_char, size: c_int, color: *mut u32) -> *mut u8 {
+    use resvg::{tiny_skia, usvg};
+    let category = unsafe { arg(category) };
+    let (name, group) = retifs_map_core::icons::style_of(&category);
+    if !color.is_null() {
+        unsafe { *color = retifs_map_core::icons::group_rgb(group) };
+    }
+    let size = size.clamp(4, 256) as u32;
+    let Some(svg) = retifs_map_core::icons::white_svg(name) else { return std::ptr::null_mut() };
+    let Ok(tree) = usvg::Tree::from_str(&svg, &usvg::Options::default()) else { return std::ptr::null_mut() };
+    let Some(mut pixmap) = tiny_skia::Pixmap::new(size, size) else { return std::ptr::null_mut() };
+    let t = tree.size();
+    let scale = size as f32 / t.width().max(t.height());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    // White: only its coverage matters, as alpha.
+    let rgba: Vec<u8> = pixmap.data().chunks(4).flat_map(|p| [255, 255, 255, p[3]]).collect();
+    let mut len = 0;
+    bytes(rgba, &mut len)
 }
 
 /// A record's attributes for its bubble: `[[key, value]]`.

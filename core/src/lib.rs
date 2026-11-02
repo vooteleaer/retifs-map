@@ -4,6 +4,7 @@
 //! them; it shows them, and lets the user place a contact or an event whose
 //! address or location has no coordinates yet.
 
+pub mod icons;
 pub mod vector;
 
 use std::collections::HashMap;
@@ -374,10 +375,24 @@ pub struct Map {
     /// RETIFS_VIA=<node>: every request to that own node over a Link
     /// (ADR-0019): a thin client, nothing kept here.
     via: Option<String>,
-    /// Per library, the keys its index declares searchable: what may be
-    /// asked of it when held lazily (a library of tiles has no `cell`).
-    keys: std::sync::Mutex<HashMap<String, Vec<String>>>,
 }
+
+/// Per library, the keys its index declares searchable: what may be asked
+/// of it when held lazily (a library of tiles has no `cell`). Shared by
+/// every Map of the process (an app's workers each have one).
+fn key_cache() -> &'static std::sync::Mutex<HashMap<String, Vec<String>>> {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+
+/// Libraries whose index wasn't found (its holders far or away), and when:
+/// not asked again for a minute, each question may wait seconds.
+fn key_misses() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static MISSES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    MISSES.get_or_init(Default::default)
+}
+
+const KEY_MISS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for Map {
     fn default() -> Self {
@@ -389,7 +404,7 @@ impl Map {
     pub fn new() -> Self {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
         let via = std::env::var("RETIFS_VIA").ok().filter(|v| !v.trim().is_empty());
-        Map { rt, store: libretifs::default_store_dir(), via, keys: Default::default() }
+        Map { rt, store: libretifs::default_store_dir(), via }
     }
 
     /// Saves a new place in `ns`; its record ID.
@@ -466,7 +481,7 @@ impl Map {
             .iter()
             .filter(|ns| {
                 self.searchable(&mut c, ns, "cell");
-                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "cell"))
+                key_cache().lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "cell"))
             })
             .cloned()
             .collect()
@@ -478,7 +493,7 @@ impl Map {
             .iter()
             .filter(|ns| {
                 self.searchable(&mut c, ns, "find");
-                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "find") && !k.iter().any(|k| k == "cell"))
+                key_cache().lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "find") && !k.iter().any(|k| k == "cell"))
             })
             .cloned()
             .collect()
@@ -487,7 +502,11 @@ impl Map {
     /// Whether `key` may be searched for in `ns`: its index declares it, or
     /// it declares nothing (held whole, searched here). Asked once a library.
     fn searchable(&self, c: &mut Client, ns: &str, key: &str) -> bool {
-        let known = self.keys.lock().expect("keys lock").get(ns).cloned();
+        let known = key_cache().lock().expect("keys lock").get(ns).cloned();
+        let missed = key_misses().lock().expect("misses lock").get(ns).is_some_and(|t| t.elapsed() < KEY_MISS_WAIT);
+        if known.is_none() && missed {
+            return true;
+        }
         let keys = known.unwrap_or_else(|| {
             let keys: Vec<String> = self
                 .query(c, ns, "type=retifs.index".into())
@@ -499,8 +518,10 @@ impl Map {
                 }))
                 .collect();
             // None found may be a failed question: asked again next time.
-            if !keys.is_empty() {
-                self.keys.lock().expect("keys lock").insert(ns.to_string(), keys.clone());
+            if keys.is_empty() {
+                key_misses().lock().expect("misses lock").insert(ns.to_string(), std::time::Instant::now());
+            } else {
+                key_cache().lock().expect("keys lock").insert(ns.to_string(), keys.clone());
             }
             keys
         });
