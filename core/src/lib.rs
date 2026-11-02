@@ -457,6 +457,20 @@ impl Map {
 
     /// The libraries among these that are only searched (their index
     /// declares `find` but no `cell`): a gazetteer, not places to draw.
+    /// The libraries among these whose index declares places by cell (a
+    /// map's cafés): held lazily, what they have to show is known only so.
+    pub fn place_libraries(&self, libraries: &[String]) -> Vec<String> {
+        let Ok(mut c) = self.client() else { return Vec::new() };
+        libraries
+            .iter()
+            .filter(|ns| {
+                self.searchable(&mut c, ns, "cell");
+                self.keys.lock().expect("keys lock").get(*ns).is_some_and(|k| k.iter().any(|k| k == "cell"))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn address_libraries(&self, libraries: &[String]) -> Vec<String> {
         let Ok(mut c) = self.client() else { return Vec::new() };
         libraries

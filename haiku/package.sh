@@ -11,7 +11,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 APP=$HERE/build/Map
 STAGE=$HERE/build/package
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)-1
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)-2
 ARCH=x86_64
 
 for f in Map lib/libretifs_map.so; do

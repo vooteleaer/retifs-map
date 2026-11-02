@@ -16,6 +16,7 @@
 #include <LayoutBuilder.h>
 #include <MessageRunner.h>
 #include <RadioButton.h>
+#include <Screen.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
 #include <SpaceLayoutItem.h>
@@ -32,6 +33,7 @@
 #include <string.h>
 
 #include <atomic>
+#include <list>
 #include <map>
 #include <set>
 #include <string>
@@ -49,7 +51,7 @@ enum {
 	kTile = 'tile',			// worker: draw a tile
 	kTileDone = 'tdon',
 	kPickMap = 'pmap',
-	kKinds = 'kind',
+	kLibraries = 'libs',	// window: a library shown or hidden
 	kZoomIn = 'zmin',
 	kZoomOut = 'zmou',
 	kChanges = 'chng',
@@ -597,9 +599,10 @@ public:
 		Invalidate();
 	}
 
-	void SetShown(const std::set<BString>& kinds)
+	/*! The libraries whose places aren't shown. */
+	void SetHidden(const std::set<BString>& libraries)
 	{
-		fShown = kinds;
+		fHidden = libraries;
 		Invalidate();
 	}
 
@@ -981,7 +984,7 @@ private:
 		double left = fCenterX - b.Width() / 2, top = fCenterY - b.Height() / 2;
 		std::map<std::string, Group> groups;
 		for (const Place& p : fPlaces) {
-			if (fShown.find(p.kind) == fShown.end())
+			if (fHidden.find(p.ns) != fHidden.end())
 				continue;
 			if (p.hasMinZoom && fZoom < p.minZoom)
 				continue;
@@ -1106,7 +1109,7 @@ private:
 	std::map<uint64, bigtime_t> fFailed;
 	std::vector<TileWorker*> fWorkers;
 	std::vector<Place> fPlaces;
-	std::set<BString> fShown;
+	std::set<BString> fHidden;
 	bool fDragging, fMoved;
 	BPoint fLast;
 	size_t fNextWorker;
@@ -1354,35 +1357,21 @@ public:
 		fAdd->SetToolTip("Add a place");
 		fAnnounces = new BButton("announces", "Announces", new BMessage(kAnnounces));
 		fAnnounces->SetToolTip("Public libraries heard on the network");
+		fAnnounces->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
 		fStatus = new BStringView("status", "");
 		fStatus->SetHighUIColor(B_PANEL_TEXT_COLOR, B_LIGHTEN_1_TINT);
 		BFont small(be_plain_font);
 		small.SetSize(small.Size() * 0.9);
 		fStatus->SetFont(&small);
 
-		fMaps = new BGroupView(B_VERTICAL, 2);
-		fLayers = new BGroupView(B_VERTICAL, 2);
-		fWaiting = new BStringView("waiting", "");
-		const char* kinds[][2] = {
-			{ "photo", "Photos" }, { "person", "Contacts" },
-			{ "event", "Events" }, { "place", "Saved places" } };
-		for (auto& k : kinds) {
-			BMessage* m = new BMessage(kKinds);
-			BCheckBox* box = new BCheckBox(k[0], k[1], m);
-			box->SetValue(B_CONTROL_ON);
-			fLayers->AddChild(box);
-			fShown.insert(k[0]);
-		}
+		fLibraries = new BGroupView(B_VERTICAL, 2);
 
 		BGroupView* side = new BGroupView(B_VERTICAL, B_USE_DEFAULT_SPACING);
 		BLayoutBuilder::Group<>(side)
 			.SetInsets(B_USE_WINDOW_SPACING)
-			.Add(_Heading("Maps"))
-			.Add(fMaps)
-			.Add(_Heading("Layers"))
-			.Add(fLayers)
-			.Add(_Heading("Waiting for a place"))
-			.Add(fWaiting)
+			.Add(fAnnounces)
+			.Add(_Heading("Libraries"))
+			.Add(fLibraries)
 			.AddGlue()
 			.Add(fStatus);
 		side->SetExplicitMinSize(BSize(240, B_SIZE_UNSET));
@@ -1398,7 +1387,6 @@ public:
 					.AddGlue()
 					.Add(fSearch)
 					.AddGlue()
-					.Add(fAnnounces)
 				.End()
 				.Add(new BSeparatorView(B_HORIZONTAL))
 				.Add(fMap)
@@ -1418,6 +1406,26 @@ public:
 		delete fRunner;
 		fWorker->Lock();
 		fWorker->Quit();
+	}
+
+	/*! The zoom button puts the window over the whole screen (its tab and
+		border just outside), and back where it was. */
+	void Zoom(BPoint, float, float)
+	{
+		if (fZoomed) {
+			MoveTo(fRestore.LeftTop());
+			ResizeTo(fRestore.Width(), fRestore.Height());
+			fZoomed = false;
+			return;
+		}
+		fRestore = Frame();
+		BRect screen = BScreen(this).Frame();
+		BRect frame = Frame(), outer = DecoratorFrame();
+		float left = frame.left - outer.left, top = frame.top - outer.top;
+		float right = outer.right - frame.right, bottom = outer.bottom - frame.bottom;
+		MoveTo(screen.left + left, screen.top + top);
+		ResizeTo(screen.Width() - left - right, screen.Height() - top - bottom);
+		fZoomed = true;
 	}
 
 	void MessageReceived(BMessage* message)
@@ -1458,15 +1466,23 @@ public:
 			case kReload:
 				fWorker->PostMessage(kLoad);
 				break;
-			case kKinds:
+			case kLibraries:
 			{
-				fShown.clear();
-				for (int32 i = 0; i < fLayers->CountChildren(); i++) {
-					BCheckBox* box = dynamic_cast<BCheckBox*>(fLayers->ChildAt(i));
-					if (box != NULL && box->Value() == B_CONTROL_ON)
-						fShown.insert(box->Name());
+				// A map turned on is the one drawn (the last one turned on wins).
+				BCheckBox* source = NULL;
+				if (message->FindPointer("source", (void**)&source) == B_OK
+					&& source != NULL && source->Value() == B_CONTROL_ON) {
+					fMapOrder.remove(BString(source->Name()));
+					fMapOrder.push_back(BString(source->Name()));
 				}
-				fMap->SetShown(fShown);
+				fHidden.clear();
+				for (int32 i = 0; i < fLibraries->CountChildren(); i++) {
+					BCheckBox* box = dynamic_cast<BCheckBox*>(fLibraries->ChildAt(i));
+					if (box != NULL && box->Value() != B_CONTROL_ON)
+						fHidden.insert(box->Name());
+				}
+				fMap->SetHidden(fHidden);
+				_ShowFirstMap();
 				break;
 			}
 			case kChanged:
@@ -1532,57 +1548,68 @@ private:
 			list.push_back(p);
 		}
 		fMap->SetPlaces(list);
-		fMap->SetShown(fShown);
-
-		BString waiting;
-		int32 n = Count(unplaced);
-		if (n == 0)
-			waiting = "Nothing: every contact and event with an address has a place.";
-		else
-			waiting << n << (n == 1 ? " record has" : " records have")
-				<< " an address but no place yet.";
-		fWaiting->SetText(waiting);
-
-		// The maps: one to show (or none), as the Linux sidebar lists them.
-		while (fMaps->CountChildren() > 0) {
-			BView* v = fMaps->ChildAt(0);
-			fMaps->RemoveChild(v);
-			delete v;
-		}
-		BString first;
-		for (int32 i = 0; i < Count(fTilesets); i++) {
-			BMessage t = Item(fTilesets, i);
-			if (t.GetBool("overlay", false))
-				continue;
-			BMessage* m = new BMessage(kPickMap);
-			m->AddString("map", t.GetString("id", ""));
-			BRadioButton* radio = new BRadioButton(t.GetString("id", ""),
-				t.GetString("name", ""), m);
-			fMaps->AddChild(radio);
-			if (first.IsEmpty())
-				first = t.GetString("id", "");
-			if (fShownMap == t.GetString("id", ""))
-				radio->SetValue(B_CONTROL_ON);
-		}
-		BMessage* none = new BMessage(kPickMap);
-		none->AddString("map", "");
-		BRadioButton* blank = new BRadioButton("none", "No map", none);
-		fMaps->AddChild(blank);
-		if (fShownMap.IsEmpty() && first.IsEmpty())
-			blank->SetValue(B_CONTROL_ON);
+		fMap->SetHidden(fHidden);
+		_FillLibraries(data, list);
 
 		BString status;
 		status << list.size() << " place(s) in "
 			<< Count(*_Find(data, "libraries")) << " libraries";
 		fStatus->SetText(status);
 
-		if (!fFitted && !first.IsEmpty() && fShownMap.IsEmpty()) {
-			_Pick(first, true);
-			BRadioButton* radio = dynamic_cast<BRadioButton*>(
-				fMaps->FindView(first.String()));
-			if (radio != NULL)
-				radio->SetValue(B_CONTROL_ON);
+		_ShowFirstMap();
+	}
+
+	/*! A checkbox per library with something the map shows: a map (its
+		tiles), places, places held lazily (a map's cafés). None for a library
+		with nothing to put on a map, or a gazetteer (only searched). */
+	void _FillLibraries(const BMessage& data, const std::vector<Place>& places)
+	{
+		std::map<BString, int32> counts;
+		for (const Place& p : places)
+			counts[p.ns]++;
+		BMessage lazy, address;
+		// Held lazily, a library's places are known only by its index.
+		data.FindMessage("lazy_places", &lazy);
+		data.FindMessage("address", &address);
+		std::set<BString> maps, skip;
+		for (int32 i = 0; i < Count(fTilesets); i++) {
+			BString ns = Item(fTilesets, i).GetString("ns", "");
+			maps.insert(ns);
+			if (counts.find(ns) == counts.end())
+				counts[ns] = 0;
 		}
+		for (int32 i = 0; i < Count(address); i++) {
+			BString name;
+			name << i;
+			skip.insert(address.GetString(name.String(), ""));
+		}
+		for (int32 i = 0; i < Count(lazy); i++) {
+			BString name;
+			name << i;
+			BString ns = lazy.GetString(name.String(), "");
+			if (skip.find(ns) == skip.end() && counts.find(ns) == counts.end())
+				counts[ns] = -1;
+		}
+		while (fLibraries->CountChildren() > 0) {
+			BView* v = fLibraries->ChildAt(0);
+			fLibraries->RemoveChild(v);
+			delete v;
+		}
+		for (auto& c : counts) {
+			BString label(c.first);
+			if (maps.find(c.first) != maps.end())
+				label << "  ·  map";
+			if (c.second > 0)
+				label << "  ·  " << c.second;
+			BCheckBox* box = new BCheckBox(c.first.String(), label.String(),
+				new BMessage(kLibraries));
+			box->SetValue(fHidden.find(c.first) == fHidden.end()
+				? B_CONTROL_ON : B_CONTROL_OFF);
+			box->SetTarget(this);
+			fLibraries->AddChild(box);
+		}
+		if (counts.empty())
+			fLibraries->AddChild(new BStringView(NULL, "None with places yet"));
 	}
 
 	BMessage* _Find(const BMessage& data, const char* name)
@@ -1591,6 +1618,31 @@ private:
 		found.MakeEmpty();
 		data.FindMessage(name, &found);
 		return &found;
+	}
+
+	/*! Draws the map of the first library checked that has one (none: a
+		blank map). */
+	void _ShowFirstMap()
+	{
+		// The libraries turned on last first, then the rest as listed.
+		std::vector<BString> order(fMapOrder.rbegin(), fMapOrder.rend());
+		for (int32 i = 0; i < Count(fTilesets); i++)
+			order.push_back(Item(fTilesets, i).GetString("ns", ""));
+		for (const BString& ns : order) {
+			if (fHidden.find(ns) != fHidden.end())
+				continue;
+			for (int32 i = 0; i < Count(fTilesets); i++) {
+				BMessage t = Item(fTilesets, i);
+				if (t.GetBool("overlay", false) || ns != t.GetString("ns", ""))
+					continue;
+				BString id = t.GetString("id", "");
+				if (id != fShownMap)
+					_Pick(id, true);
+				return;
+			}
+		}
+		if (!fShownMap.IsEmpty() || fTilesets.IsEmpty())
+			_Pick("", false);
 	}
 
 	/*! Shows map `id`; on the first, fits its area (as the Linux app opens). */
@@ -1623,10 +1675,11 @@ private:
 	BButton* fAdd;
 	BButton* fAnnounces;
 	BStringView* fStatus;
-	BGroupView* fMaps;
-	BGroupView* fLayers;
-	BStringView* fWaiting;
-	std::set<BString> fShown;
+	BGroupView* fLibraries;
+	std::set<BString> fHidden;
+	std::list<BString> fMapOrder;
+	bool fZoomed = false;
+	BRect fRestore;
 	BMessage fTilesets;
 	BMessage fCounts;
 	BString fShownMap;

@@ -100,7 +100,7 @@ fn bytes(v: Vec<u8>, len: *mut usize) -> *mut u8 {
 }
 
 /// Everything the window shows, read again: `{"libraries", "lazy",
-/// "address", "tilesets": [{"ns", "id", "name", "bounds", "minzoom",
+/// "address", "lazy_places" (lazy libraries with places by cell), "tilesets": [{"ns", "id", "name", "bounds", "minzoom",
 /// "maxzoom", "overlay", "attribution"}], "places": [{"i", "ns", "id",
 /// "kind", "title", "label", "lat", "lon", "when", "detail", "minzoom",
 /// "thumb"}], "unplaced": [{"ns", "id", "kind", "title", "key", "address"}],
@@ -115,6 +115,7 @@ pub extern "C" fn rm_load() -> *mut c_char {
     };
     let lazy = m.lazy(&libraries);
     let address = m.address_libraries(&libraries);
+    let lazy_places = m.place_libraries(&lazy);
     let whole: Vec<String> = libraries.iter().filter(|l| !lazy.contains(l) && !address.contains(l)).cloned().collect();
     let tilesets = m.tilesets(&libraries);
     let (places, unplaced) = m.places(&whole).unwrap_or_default();
@@ -122,6 +123,7 @@ pub extern "C" fn rm_load() -> *mut c_char {
         "libraries": libraries,
         "lazy": lazy,
         "address": address,
+        "lazy_places": lazy_places,
         "tilesets": tilesets.iter().map(|t| json!({
             "ns": t.ns, "id": t.id, "name": t.name, "bounds": t.bounds, "minzoom": t.minzoom,
             "maxzoom": t.maxzoom, "overlay": t.overlay, "attribution": t.attribution,
