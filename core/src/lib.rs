@@ -221,10 +221,11 @@ pub fn absolute_style(style: &str, ns: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
-/// Whether the map shows anything of a heard library: a map, places, or
-/// records that may carry a place (photos, contacts, events).
+/// Whether the map shows anything of a heard library: a map, places, an
+/// address library (searched), or records that may carry a place (photos,
+/// contacts, events).
 pub fn map_uses(l: &libretifs::HeardLibrary) -> bool {
-    l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == VECTOR_TILE || t == PLACE_TYPE || t.starts_with("image/") || types::is(t, types::PERSON) || types::is(t, types::EVENT))
+    l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == VECTOR_TILE || t == PLACE_TYPE || t == ADDRESS_TYPE || t.starts_with("image/") || types::is(t, types::PERSON) || types::is(t, types::EVENT))
 }
 
 /// An address search's answer: a suggestion the user may pick.
@@ -679,6 +680,14 @@ impl Map {
             Response::Namespace(v) => Ok(v),
             _ => Err("unexpected answer".into()),
         }
+    }
+
+    /// Keeps all of a library on this device (`all`: records and content,
+    /// readable offline), or only what's used (content fetched as needed).
+    pub fn keep(&self, ns: &str, all: bool) -> Result<(), String> {
+        let mut c = self.client()?;
+        let mode = if all { "all" } else { "rules" };
+        self.call(&mut c, Request::NsKeep { ns: ns.into(), mode: mode.into() }).map(|_| ())
     }
 
     pub fn leave(&self, ns: &str) -> Result<(), String> {

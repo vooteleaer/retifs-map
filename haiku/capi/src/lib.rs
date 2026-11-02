@@ -179,6 +179,7 @@ pub unsafe extern "C" fn rm_library(ns: *const c_char, lazy: c_int) -> *mut c_ch
         "records": info.as_ref().map_or(0, |v| v.records),
         "peers": info.as_ref().map_or(0, |v| v.peers),
         "lazy": info.as_ref().is_some_and(|v| v.lazy),
+        "kept": info.as_ref().is_some_and(|v| !v.lazy && v.keep == "all"),
         "writable": info.as_ref().is_some_and(|v| v.writers.iter().any(|(w, _)| *w == v.own_writer)),
         "tilesets": tilesets.iter().map(|t| json!({
             "ns": t.ns, "id": t.id, "name": t.name, "bounds": t.bounds, "minzoom": t.minzoom,
@@ -393,6 +394,13 @@ pub unsafe extern "C" fn rm_add_layer(link: *const c_char, name: *const c_char) 
 pub unsafe extern "C" fn rm_leave(ns: *const c_char) -> *mut c_char {
     let ns = unsafe { arg(ns) };
     done(map().leave(&ns).map(|()| json!({})))
+}
+
+/// Keeps all of a library here (`all` 1) or only what's used (0): `{}` or `{"error"}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rm_keep(ns: *const c_char, all: c_int) -> *mut c_char {
+    let ns = unsafe { arg(ns) };
+    done(map().keep(&ns, all != 0).map(|()| json!({})))
 }
 
 /// How often each library loaded has changed: `{ns: count}` (reload when it differs).

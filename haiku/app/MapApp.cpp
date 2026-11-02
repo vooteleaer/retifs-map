@@ -76,6 +76,8 @@ enum {
 	kLeaveAsk = 'leva',		// window: leave a library? ("ns")
 	kLeave = 'leav',		// worker: leave it ("ns")
 	kLeft = 'left',			// window: left ("result")
+	kKeep = 'keep',			// worker: keep all here or not ("ns", "all")
+	kKept = 'kept',			// window: done ("result")
 };
 
 static const int kTileSize = 256;
@@ -526,6 +528,16 @@ public:
 				left.AddMessage("result", new BMessage(Take(
 					rm_leave(message->GetString("ns", "")))));
 				fTarget.SendMessage(&left);
+				break;
+			}
+			case kKeep:
+			{
+				BMessage kept(kKept);
+				kept.AddString("ns", message->GetString("ns", ""));
+				kept.AddMessage("result", new BMessage(Take(rm_keep(
+					message->GetString("ns", ""),
+					message->GetBool("all", false) ? 1 : 0))));
+				fTarget.SendMessage(&kept);
 				break;
 			}
 			case kChanges:
@@ -1695,6 +1707,26 @@ public:
 				fLeaving = "";
 				break;
 			}
+			case kKeep:
+			{
+				BString ns = message->GetString("ns", "");
+				fWorker->PostMessage(message);
+				fStatus->SetText(message->GetBool("all", false)
+					? BString("Keeping ") << ns << " on this device…"
+					: BString("Keeping only what's used of ") << ns << "…");
+				break;
+			}
+			case kKept:
+			{
+				BMessage result;
+				message->FindMessage("result", &result);
+				if (result.HasString("error")) {
+					fStatus->SetText(result.GetString("error", ""));
+					break;
+				}
+				fWorker->PostMessage(kLoad);
+				break;
+			}
 			case kLeft:
 			{
 				BMessage result;
@@ -1737,6 +1769,13 @@ public:
 		toggle->AddString("ns", item->Ns());
 		menu->AddItem(new BMenuItem(item->Check()->Value() == B_CONTROL_ON
 			? "Hide on the map" : "Show on the map", toggle));
+		bool kept = fInfo[item->Ns()].GetBool("kept", false);
+		BMessage* keep = new BMessage(kKeep);
+		keep->AddString("ns", item->Ns());
+		keep->AddBool("all", !kept);
+		BMenuItem* keepItem = new BMenuItem("Keep on this device", keep);
+		keepItem->SetMarked(kept);
+		menu->AddItem(keepItem);
 		menu->AddSeparatorItem();
 		BMessage* leave = new BMessage(kLeaveAsk);
 		leave->AddString("ns", item->Ns());
@@ -1873,6 +1912,8 @@ private:
 			detail << Grouped(records) << (records == 1 ? " record" : " records");
 			if (info.GetBool("lazy", false))
 				detail << " here";
+			if (info.GetBool("kept", false))
+				detail << "  ·  on this device";
 			int32 peers = (int32)info.GetDouble("peers", 0);
 			detail << "  ·  " << peers << (peers == 1 ? " peer" : " peers");
 			fLibraries->AddChild(new LibraryItem(c.first, detail,

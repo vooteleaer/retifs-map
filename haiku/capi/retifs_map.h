@@ -28,7 +28,7 @@ char* rm_load(void);
 /* The libraries to read one by one: {"libraries", "lazy", "address"}. */
 char* rm_libraries(void);
 /* One library: {"ns", "tilesets", "places", "unplaced", "by_cell", "records",
- * "peers", "lazy", "writable"}. */
+ * "peers", "lazy", "kept", "writable"}. */
 char* rm_library(const char* ns, int lazy);
 char* rm_places_in(const char* ns, double west, double south, double east,
 	double north, int zoom);
@@ -46,6 +46,8 @@ char* rm_heard(void);
 char* rm_join(const char* address);
 char* rm_add_layer(const char* link, const char* name);
 char* rm_leave(const char* ns);
+/* Keeps all of a library here (all 1: readable offline) or what's used (0). */
+char* rm_keep(const char* ns, int all);
 char* rm_change_counts(void);
 
 void rm_free(char* s);
