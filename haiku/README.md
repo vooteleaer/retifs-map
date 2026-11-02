@@ -13,6 +13,13 @@ The map with the Haiku API, over the shared core (`../core`) as a C library
   a library like the others. With several maps turned on, the one turned on
   last is drawn.
 - Announces: the public libraries heard that the map can use, with Join.
+- A marker clicked opens its bubble (a photo's preview, which opens larger;
+  a contact's details; an event's time and place; a place's hours), or, for
+  several places apart, zooms in on them. Photos show their thumbnails;
+  markers that would overlap are pushed apart.
+- The search field (Enter) finds addresses and places; picking one goes
+  there. A lazy library's places (a map's cafés) are asked for by area from
+  zoom 12.
 
 ## Building, on Haiku
 
@@ -26,6 +33,5 @@ with retifs next to retifs-map. The result is `haiku/build/Map` and the
 - Several maps over each other, each with its own opacity (a slider per map
   library): each map's tiles drawn into bitmaps of their own, composed with
   B_OP_ALPHA at a constant alpha.
-- The info bubble on a marker, the address search, adding and placing a
-  place, a map's public places (cafés) with their category icons, markers of
-  one spot set apart.
+- Adding and placing a place; a map's public places (cafés) with their
+  category icons (Maki).

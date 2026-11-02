@@ -10,6 +10,8 @@
 
 #include <Application.h>
 #include <Bitmap.h>
+#include <DataIO.h>
+#include <TranslationUtils.h>
 #include <Button.h>
 #include <CheckBox.h>
 #include <GroupView.h>
@@ -76,6 +78,21 @@ enum {
 	kLeaveAsk = 'leva',		// window: leave a library? ("ns")
 	kLeave = 'leav',		// worker: leave it ("ns")
 	kLeft = 'left',			// window: left ("result")
+	kThumb = 'thmb',		// tile worker: a photo's thumbnail ("i")
+	kThumbDone = 'thmd',
+	kPreview = 'prev',		// tile worker: a photo's preview ("i", "reply")
+	kPreviewDone = 'prvd',
+	kDetails = 'detl',		// tile worker: a record's attributes ("ns", "id", "reply")
+	kDetailsDone = 'dtld',
+	kCloseBubble = 'clbb',
+	kOpenPhoto = 'ophp',
+	kSearch = 'srch',		// window: search what's typed
+	kFind = 'find',			// worker: search ("text")
+	kFound = 'fnd_',		// window: what was found
+	kPick = 'pick',			// window: one picked ("lat", "lon", "zoom", "place")
+	kViewChanged = 'vchg',	// window: the map moved or zoomed
+	kPlacesIn = 'plin',		// worker: a lazy library's places in an area
+	kPlacesFound = 'plfd',
 	kKeep = 'keep',			// worker: keep all here or not ("ns", "all")
 	kKept = 'kept',			// window: done ("result")
 };
@@ -168,6 +185,76 @@ Lat(double y, int z)
 {
 	double n = M_PI - 2.0 * M_PI * y / (kTileSize * (double)(1 << z));
 	return 180.0 / M_PI * atan(0.5 * (exp(n) - exp(-n)));
+}
+
+
+// #pragma mark - Images
+
+
+/*! An image's bytes (JPEG, PNG…) as a bitmap, by the Translation Kit. */
+static BBitmap*
+Decode(const uint8* data, size_t length)
+{
+	if (data == NULL || length == 0)
+		return NULL;
+	BMemoryIO io(data, length);
+	BBitmap* bitmap = BTranslationUtils::GetBitmap(&io);
+	if (bitmap == NULL || !bitmap->IsValid()) {
+		delete bitmap;
+		return NULL;
+	}
+	if (bitmap->ColorSpace() != B_RGBA32 && bitmap->ColorSpace() != B_RGB32) {
+		BBitmap* rgba = new BBitmap(bitmap->Bounds(), B_RGBA32);
+		rgba->ImportBits(bitmap);
+		delete bitmap;
+		bitmap = rgba;
+	}
+	return bitmap;
+}
+
+
+/*! `source` (or its middle square, if `square`) scaled down to fit
+	width×height, each pixel the average of those it covers. */
+static BBitmap*
+Scaled(const BBitmap* source, int width, int height, bool square)
+{
+	int sw = source->Bounds().IntegerWidth() + 1;
+	int sh = source->Bounds().IntegerHeight() + 1;
+	int sx0 = 0, sy0 = 0;
+	if (square) {
+		int side = std::min(sw, sh);
+		sx0 = (sw - side) / 2;
+		sy0 = (sh - side) / 2;
+		sw = sh = side;
+	}
+	double scale = std::min(1.0, std::min((double)width / sw, (double)height / sh));
+	int dw = std::max(1, (int)(sw * scale)), dh = std::max(1, (int)(sh * scale));
+	BBitmap* out = new BBitmap(BRect(0, 0, dw - 1, dh - 1), B_RGBA32);
+	const uint8* in = (const uint8*)source->Bits();
+	int inRow = source->BytesPerRow();
+	bool alpha = source->ColorSpace() == B_RGBA32;
+	uint8* to = (uint8*)out->Bits();
+	int outRow = out->BytesPerRow();
+	for (int y = 0; y < dh; y++) {
+		int ya = sy0 + y * sh / dh, yb = std::max(ya + 1, sy0 + (y + 1) * sh / dh);
+		for (int x = 0; x < dw; x++) {
+			int xa = sx0 + x * sw / dw, xb = std::max(xa + 1, sx0 + (x + 1) * sw / dw);
+			uint32 sum[4] = { 0, 0, 0, 0 }, n = 0;
+			for (int yy = ya; yy < yb; yy++) {
+				const uint8* p = in + yy * inRow + xa * 4;
+				for (int xx = xa; xx < xb; xx++, p += 4, n++) {
+					sum[0] += p[0];
+					sum[1] += p[1];
+					sum[2] += p[2];
+					sum[3] += alpha ? p[3] : 255;
+				}
+			}
+			uint8* q = to + y * outRow + x * 4;
+			for (int c = 0; c < 4; c++)
+				q[c] = sum[c] / n;
+		}
+	}
+	return out;
 }
 
 
@@ -397,6 +484,43 @@ public:
 
 	void MessageReceived(BMessage* message)
 	{
+		if (message->what == kThumb || message->what == kPreview) {
+			int32 i = message->GetInt32("i", 0);
+			size_t length = 0;
+			uint8* data = message->what == kThumb ? rm_thumb(i, &length)
+				: rm_preview(i, &length);
+			BBitmap* image = Decode(data, length);
+			if (data != NULL)
+				rm_free_bytes(data, length);
+			fprintf(stderr, "%s %d: %d bytes, %s\n",
+				message->what == kThumb ? "thumb" : "preview", (int)i,
+				(int)length, image != NULL ? "decoded" : "not decoded");
+			if (image != NULL && message->what == kThumb) {
+				BBitmap* small = Scaled(image, 80, 80, true);
+				delete image;
+				image = small;
+			}
+			BMessage done(message->what == kThumb ? kThumbDone : kPreviewDone);
+			done.AddInt32("i", i);
+			done.AddPointer("bitmap", image);
+			BMessenger reply;
+			if (message->FindMessenger("reply", &reply) != B_OK)
+				reply = fTarget;
+			if (reply.SendMessage(&done) != B_OK)
+				delete image;
+			return;
+		}
+		if (message->what == kDetails) {
+			BMessage done(kDetailsDone);
+			done.AddString("id", message->GetString("id", ""));
+			done.AddMessage("details", new BMessage(Take(rm_details(
+				message->GetString("ns", ""), message->GetString("id", "")))));
+			BMessenger reply;
+			if (message->FindMessenger("reply", &reply) != B_OK)
+				reply = fTarget;
+			reply.SendMessage(&done);
+			return;
+		}
 		if (message->what != kTile) {
 			BLooper::MessageReceived(message);
 			return;
@@ -519,6 +643,25 @@ public:
 					rm_join(message->GetString("address", "")))));
 				reply.SendMessage(&joined);
 				fTarget.SendMessage(kReload);
+				break;
+			}
+			case kFind:
+			{
+				BMessage found(kFound);
+				found.AddString("text", message->GetString("text", ""));
+				found.AddMessage("found", new BMessage(Take(
+					rm_find(message->GetString("text", "")))));
+				fTarget.SendMessage(&found);
+				break;
+			}
+			case kPlacesIn:
+			{
+				BMessage found(kPlacesFound);
+				found.AddMessage("places", new BMessage(Take(rm_places_in(
+					message->GetString("ns", ""), message->GetDouble("w", 0),
+					message->GetDouble("s", 0), message->GetDouble("e", 0),
+					message->GetDouble("n", 0), message->GetInt32("zoom", 0)))));
+				fTarget.SendMessage(&found);
 				break;
 			}
 			case kLeave:
@@ -645,7 +788,8 @@ Grouped(int64 n)
 
 struct Place {
 	int32 index;
-	BString ns, id, kind, title;
+	BString ns, id, kind, title, detail;
+	bool hasThumb;
 	double lat, lon;
 	bool hasMinZoom;
 	double minZoom;
@@ -678,6 +822,329 @@ KindGlyph(const BString& kind)
 }
 
 
+// #pragma mark - Photo window
+
+
+/*! A photo, large, in a window of its own. */
+class PhotoView : public BView {
+public:
+	PhotoView(BBitmap* bitmap)
+		:
+		BView("photo", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
+		fBitmap(bitmap)
+	{
+		SetViewColor(30, 30, 30);
+	}
+
+	~PhotoView() { delete fBitmap; }
+
+	void SetBitmap(BBitmap* bitmap)
+	{
+		delete fBitmap;
+		fBitmap = bitmap;
+		Invalidate();
+	}
+
+	void Draw(BRect)
+	{
+		if (fBitmap == NULL)
+			return;
+		BRect b = Bounds(), s = fBitmap->Bounds();
+		float scale = std::min(b.Width() / s.Width(), b.Height() / s.Height());
+		scale = std::min(scale, 1.0f);
+		float w = s.Width() * scale, h = s.Height() * scale;
+		BRect r(0, 0, w, h);
+		r.OffsetTo((b.Width() - w) / 2, (b.Height() - h) / 2);
+		DrawBitmap(fBitmap, s, r);
+	}
+
+private:
+	BBitmap* fBitmap;
+};
+
+
+class PhotoWindow : public BWindow {
+public:
+	PhotoWindow(const BString& title, BBitmap* shown)
+		:
+		BWindow(BRect(80, 60, 1080, 780), title.String(), B_TITLED_WINDOW,
+			B_AUTO_UPDATE_SIZE_LIMITS)
+	{
+		fView = new PhotoView(shown);
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0).Add(fView);
+		CenterOnScreen();
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		if (message->what == kPreviewDone) {
+			BBitmap* bitmap = NULL;
+			if (message->FindPointer("bitmap", (void**)&bitmap) == B_OK
+				&& bitmap != NULL)
+				fView->SetBitmap(bitmap);
+			return;
+		}
+		BWindow::MessageReceived(message);
+	}
+
+private:
+	PhotoView* fView;
+};
+
+
+// #pragma mark - Bubble
+
+
+/*! A photo's preview in the bubble; a click opens it larger. */
+class PreviewView : public BView {
+public:
+	PreviewView()
+		:
+		BView("preview", B_WILL_DRAW),
+		fBitmap(NULL)
+	{
+		SetViewColor(B_TRANSPARENT_COLOR);
+		SetExplicitSize(BSize(268, 180));
+	}
+
+	~PreviewView() { delete fBitmap; }
+
+	void SetBitmap(BBitmap* bitmap)
+	{
+		delete fBitmap;
+		fBitmap = bitmap;
+		Invalidate();
+	}
+
+	const BBitmap* Bitmap() const { return fBitmap; }
+
+	void Draw(BRect)
+	{
+		BRect b = Bounds();
+		SetHighUIColor(B_PANEL_BACKGROUND_COLOR, B_DARKEN_1_TINT);
+		FillRect(b);
+		if (fBitmap == NULL) {
+			SetHighUIColor(B_PANEL_TEXT_COLOR);
+			DrawString("Loading…", BPoint(8, b.Height() / 2));
+			return;
+		}
+		BRect s = fBitmap->Bounds();
+		BPoint at((b.Width() - s.Width()) / 2, (b.Height() - s.Height()) / 2);
+		DrawBitmap(fBitmap, at);
+	}
+
+	void MouseDown(BPoint)
+	{
+		if (fBitmap != NULL)
+			Window()->PostMessage(kOpenPhoto);
+	}
+
+private:
+	BBitmap* fBitmap;
+};
+
+
+/*! The info bubble of a place clicked on the map, kept over its place as
+	the map moves (the map draws its pointer). What it shows depends on the
+	record: a photo's preview, a contact's details, an event's time and
+	place, a place's category and hours. */
+class Bubble : public BView {
+public:
+	Bubble(const Place& p, int32 here, BHandler* map)
+		:
+		BView("bubble", B_WILL_DRAW | B_FRAME_EVENTS),
+		fPlace(p),
+		fPreview(NULL)
+	{
+		SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+		BString title(p.title);
+		if (here > 1)
+			title << " (and " << (here - 1) << " more here)";
+		BStringView* head = new BStringView(NULL, title.String());
+		head->SetFont(be_bold_font);
+		head->SetTruncation(B_TRUNCATE_END);
+		BButton* close = new BButton("close", "×", new BMessage(kCloseBubble));
+		close->SetTarget(map);
+		close->SetFlat(true);
+		close->SetExplicitSize(BSize(22, 22));
+		BString what(p.detail.IsEmpty() ? _KindName(p.kind) : p.detail.String());
+		what << "  ·  " << p.ns;
+		fBody = new BGroupView(B_VERTICAL, 2);
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 4)
+			.SetInsets(10, 6, 6, 10)
+			.AddGroup(B_HORIZONTAL, 4)
+				.Add(head)
+				.AddGlue()
+				.Add(close)
+			.End()
+			.Add(_Dim(what))
+			.Add(fBody);
+		if (p.kind == "photo") {
+			fPreview = new PreviewView();
+			fBody->AddChild(fPreview);
+		}
+		SetExplicitMaxSize(BSize(300, B_SIZE_UNSET));
+	}
+
+	const Place& Shown() const { return fPlace; }
+	PreviewView* Preview() const { return fPreview; }
+
+	void Draw(BRect)
+	{
+		SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR),
+			B_DARKEN_3_TINT));
+		StrokeRect(Bounds());
+	}
+
+	/*! The record's details, by what it is. */
+	void Fill(const BMessage& details)
+	{
+		std::vector<std::pair<BString, BString> > attrs;
+		for (int32 i = 0; i < Count(details); i++) {
+			BMessage pair = Item(details, i);
+			attrs.push_back(std::make_pair(BString(pair.GetString("0", "")),
+				BString(pair.GetString("1", ""))));
+		}
+		auto get = [&](const char* key) {
+			for (auto& a : attrs) {
+				if (a.first == key)
+					return a.second;
+			}
+			return BString();
+		};
+		// "phone", "phone:work": labelled values.
+		auto labelled = [&](const char* prefix, const char* plain) {
+			BString colon(prefix);
+			colon << ":";
+			for (auto& a : attrs) {
+				if (a.first == prefix)
+					_Line(plain, a.second);
+				else if (a.first.StartsWith(colon)) {
+					BString label(a.first);
+					label.Remove(0, colon.Length());
+					_Line(label.String(), a.second);
+				}
+			}
+		};
+		const BString& kind = fPlace.kind;
+		if (kind == "photo") {
+			_Line("Taken", _When(get("taken")));
+			BString camera(get("camera:make"));
+			camera << " " << get("camera:model");
+			_Line("Camera", camera.Trim());
+		} else if (kind == "person") {
+			labelled("phone", "Phone");
+			labelled("email", "E-mail");
+			labelled("address", "Address");
+			_Line("Birthday", get("birthday"));
+			_Line("Note", get("note"));
+		} else if (kind == "event") {
+			BString start = get("start"), end = get("end"), span;
+			if (!start.IsEmpty() && !end.IsEmpty()) {
+				BString endShown(end);
+				if (start.Length() >= 10 && end.Length() >= 16
+					&& BString(start.String(), 10) == BString(end.String(), 10))
+					end.CopyInto(endShown, 11, 5);
+				else
+					endShown = _When(end);
+				span << _When(start) << " – " << endShown;
+			} else if (!start.IsEmpty())
+				span = _When(start);
+			_Line("When", span);
+			_Line("Where", get("location"));
+			_Line("Repeats", get("rrule"));
+			BString people;
+			for (auto& a : attrs) {
+				if (a.first.StartsWith("attendee:")) {
+					if (!people.IsEmpty())
+						people << ", ";
+					people << a.second;
+				}
+			}
+			_Line("With", people);
+			_Line("Note", get("note"));
+		} else {
+			_Line("Address", get("address"));
+			_Line("Open", get("opening_hours"));
+			_Line("Phone", get("phone"));
+			_Line("Website", get("website"));
+			_Line("Cuisine", get("cuisine"));
+			_Line("Note", get("note"));
+		}
+		BString where;
+		where.SetToFormat("%.5f, %.5f", fPlace.lat, fPlace.lon);
+		fBody->AddChild(_Dim(where));
+		Fit();
+	}
+
+	/*! As big as its contents now. */
+	void Fit()
+	{
+		InvalidateLayout(true);
+		BSize size = GetLayout()->PreferredSize();
+		ResizeTo(std::min(size.width, 300.0f), size.height);
+		Layout(true);
+	}
+
+private:
+	static const char* _KindName(const BString& kind)
+	{
+		if (kind == "photo")
+			return "Photo";
+		if (kind == "person")
+			return "Contact";
+		if (kind == "event")
+			return "Event";
+		return "Place";
+	}
+
+	/*! "2026-10-25T17:00" as "25.10.2026 17:00". */
+	static BString _When(const BString& t)
+	{
+		if (t.Length() < 10)
+			return t;
+		BString out;
+		out << BString(t.String() + 8, 2) << "." << BString(t.String() + 5, 2)
+			<< "." << BString(t.String(), 4);
+		if (t.Length() >= 16)
+			out << " " << BString(t.String() + 11, 5);
+		return out;
+	}
+
+	static BStringView* _Dim(const BString& text)
+	{
+		BStringView* v = new BStringView(NULL, text.String());
+		BFont small(be_plain_font);
+		small.SetSize(small.Size() * 0.85);
+		v->SetFont(&small);
+		v->SetHighColor(mix_color(ui_color(B_PANEL_TEXT_COLOR),
+			ui_color(B_PANEL_BACKGROUND_COLOR), 150));
+		v->SetTruncation(B_TRUNCATE_END);
+		return v;
+	}
+
+	void _Line(const char* label, const BString& value)
+	{
+		BString v(value);
+		if (v.Trim().IsEmpty())
+			return;
+		BStringView* l = _Dim(label);
+		l->SetExplicitSize(BSize(70, B_SIZE_UNSET));
+		BStringView* text = new BStringView(NULL, v.String());
+		text->SetTruncation(B_TRUNCATE_END);
+		text->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+		BGroupView* row = new BGroupView(B_HORIZONTAL, 6);
+		row->AddChild(l);
+		row->AddChild(text);
+		fBody->AddChild(row);
+	}
+
+	Place fPlace;
+	BGroupView* fBody;
+	PreviewView* fPreview;
+};
+
+
 // #pragma mark - The map
 
 
@@ -702,6 +1169,45 @@ public:
 	~MapView()
 	{
 		_Clear();
+		for (auto& t : fThumbs)
+			delete t.second;
+	}
+
+	/*! Shows the bubble of the place with this number, if it's loaded. */
+	void OpenBubble(int32 index)
+	{
+		for (const Place& p : fPlaces) {
+			if (p.index == index) {
+				_OpenBubble(p, 1);
+				return;
+			}
+		}
+	}
+
+	/*! Puts lat, lon in the middle at `zoom`. */
+	void CenterOn(double lat, double lon, int zoom)
+	{
+		_SetZoom(std::max(0, std::min(kMaxZoom, zoom)));
+		fCenterX = WorldX(lon, fZoom);
+		fCenterY = WorldY(lat, fZoom);
+		Invalidate();
+		_Changed();
+	}
+
+	/*! The photo of the open bubble, large, in a window of its own. */
+	void OpenPhoto()
+	{
+		if (fBubble == NULL || fBubble->Preview() == NULL
+			|| fBubble->Preview()->Bitmap() == NULL)
+			return;
+		PhotoWindow* w = new PhotoWindow(fBubble->Shown().title,
+			new BBitmap(fBubble->Preview()->Bitmap()));
+		w->Show();
+		BMessage ask(kPreview);
+		ask.AddInt32("i", fBubble->Shown().index);
+		ask.AddMessenger("reply", BMessenger(w));
+		if (!fWorkers.empty())
+			fWorkers[0]->PostMessage(&ask);
 	}
 
 	/*! Tiles that failed are asked again: a redraw does it. */
@@ -784,6 +1290,7 @@ public:
 		fCenterY = wy * f - (around.y - b.Height() / 2);
 		_SetZoom(z);
 		Invalidate();
+		_Changed();
 	}
 
 	void Draw(BRect update)
@@ -823,6 +1330,7 @@ public:
 		}
 		_DrawLabels(shown);
 		_DrawMarkers();
+		_DrawPointer();
 		_DrawControls();
 		_DrawLoading();
 	}
@@ -863,7 +1371,19 @@ public:
 
 	void MouseUp(BPoint where)
 	{
+		bool clicked = fDragging && !fMoved;
 		fDragging = false;
+		if (fMoved)
+			_Changed();
+		if (!clicked)
+			return;
+		for (auto it = fHits.rbegin(); it != fHits.rend(); ++it) {
+			BPoint d = where - it->center;
+			if (d.x * d.x + d.y * d.y > it->radius * it->radius)
+				continue;
+			_Clicked(it->members);
+			return;
+		}
 	}
 
 	void KeyDown(const char* bytes, int32 count)
@@ -938,6 +1458,47 @@ public:
 				Invalidate();
 				break;
 			}
+			case kThumbDone:
+			{
+				BBitmap* bitmap = NULL;
+				message->FindPointer("bitmap", (void**)&bitmap);
+				int32 i = message->GetInt32("i", -1);
+				fprintf(stderr, "thumb %d arrived: %p\n", (int)i, bitmap);
+				if (bitmap != NULL) {
+					delete fThumbs[i];
+					fThumbs[i] = bitmap;
+					Invalidate();
+				}
+				break;
+			}
+			case kPreviewDone:
+			{
+				BBitmap* bitmap = NULL;
+				message->FindPointer("bitmap", (void**)&bitmap);
+				if (fBubble != NULL && fBubble->Preview() != NULL && bitmap != NULL
+					&& message->GetInt32("i", -1) == fBubble->Shown().index) {
+					fBubble->Preview()->SetBitmap(Scaled(bitmap, 268, 180, false));
+					fBubble->Fit();
+					_PlaceBubble();
+				}
+				delete bitmap;
+				break;
+			}
+			case kDetailsDone:
+			{
+				if (fBubble == NULL
+					|| fBubble->Shown().id != message->GetString("id", ""))
+					break;
+				BMessage details;
+				message->FindMessage("details", &details);
+				fBubble->Fill(details);
+				_PlaceBubble();
+				Invalidate();
+				break;
+			}
+			case kCloseBubble:
+				_CloseBubble();
+				break;
 			case kZoomIn:
 			case kZoomOut:
 				ZoomBy(message->what == kZoomIn ? 1 : -1,
@@ -961,6 +1522,125 @@ public:
 	int Zoom() const { return fZoom; }
 
 private:
+	struct Hit {
+		BPoint center;
+		float radius;
+		std::vector<const Place*> members;
+	};
+
+	/*! The window is told the view changed (a lazy library's places there
+		are asked for). */
+	void _Changed()
+	{
+		if (Window() != NULL)
+			Window()->PostMessage(kViewChanged);
+		_PlaceBubble();
+	}
+
+	/*! A marker clicked: places apart, zoomed in on; one spot, its bubble. */
+	void _Clicked(const std::vector<const Place*>& members)
+	{
+		const Place* first = members[0];
+		bool spread = false;
+		double w = first->lon, e = w, s = first->lat, n = s;
+		for (const Place* p : members) {
+			if (fabs(p->lat - first->lat) > 1e-5 || fabs(p->lon - first->lon) > 1e-5)
+				spread = true;
+			w = std::min(w, p->lon);
+			e = std::max(e, p->lon);
+			s = std::min(s, p->lat);
+			n = std::max(n, p->lat);
+		}
+		if (members.size() > 1 && spread && fZoom < kMaxZoom) {
+			int before = fZoom;
+			double padW = (e - w) * 0.2, padH = (n - s) * 0.2;
+			Fit(w - padW, s - padH, e + padW, n + padH);
+			if (fZoom <= before)
+				ZoomBy(before + 1 - fZoom, BPoint(Bounds().Width() / 2,
+					Bounds().Height() / 2));
+			_Changed();
+			return;
+		}
+		_OpenBubble(*first, members.size());
+	}
+
+	void _OpenBubble(const Place& p, int32 here)
+	{
+		_CloseBubble();
+		fBubble = new Bubble(p, here, this);
+		AddChild(fBubble);
+		fBubble->Fit();
+		_PlaceBubble();
+		if (fWorkers.empty())
+			return;
+		BMessage details(kDetails);
+		details.AddString("ns", p.ns);
+		details.AddString("id", p.id);
+		details.AddMessenger("reply", BMessenger(this));
+		fWorkers[0]->PostMessage(&details);
+		if (p.kind == "photo") {
+			BMessage preview(kPreview);
+			preview.AddInt32("i", p.index);
+			preview.AddMessenger("reply", BMessenger(this));
+			fWorkers[1 % fWorkers.size()]->PostMessage(&preview);
+		}
+		Invalidate();
+	}
+
+	void _CloseBubble()
+	{
+		if (fBubble == NULL)
+			return;
+		RemoveChild(fBubble);
+		delete fBubble;
+		fBubble = NULL;
+		Invalidate();
+	}
+
+	/*! The bubble above its place, its pointer's tip on it, kept on the map. */
+	void _PlaceBubble()
+	{
+		if (fBubble == NULL)
+			return;
+		BRect b = Bounds();
+		BPoint at = _Screen(fBubble->Shown().lat, fBubble->Shown().lon);
+		BRect f = fBubble->Bounds();
+		float x = std::max(0.0f, std::min((float)(at.x - f.Width() / 2),
+			b.Width() - f.Width()));
+		float y = std::max(0.0f, (float)(at.y - f.Height() - 12));
+		if (fBubble->Frame().LeftTop() != BPoint(x, y))
+			fBubble->MoveTo(x, y);
+		bool shown = b.Contains(at);
+		if (shown && fBubble->IsHidden())
+			fBubble->Show();
+		else if (!shown && !fBubble->IsHidden())
+			fBubble->Hide();
+	}
+
+	void _DrawPointer()
+	{
+		_PlaceBubble();
+		if (fBubble == NULL || fBubble->IsHidden())
+			return;
+		BPoint at = _Screen(fBubble->Shown().lat, fBubble->Shown().lon);
+		BRect f = fBubble->Frame();
+		float x = std::max(f.left + 8, std::min(f.right - 8, at.x));
+		SetHighUIColor(B_PANEL_BACKGROUND_COLOR);
+		FillTriangle(BPoint(x - 8, f.bottom), BPoint(x + 8, f.bottom),
+			BPoint(at.x, at.y - 4));
+		SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR),
+			B_DARKEN_3_TINT));
+		StrokeLine(BPoint(x - 8, f.bottom), BPoint(at.x, at.y - 4));
+		StrokeLine(BPoint(x + 8, f.bottom), BPoint(at.x, at.y - 4));
+	}
+
+	BPoint _Screen(double lat, double lon) const
+	{
+		BRect b = Bounds();
+		return BPoint(WorldX(lon, fZoom) - (fCenterX - b.Width() / 2),
+			WorldY(lat, fZoom) - (fCenterY - b.Height() / 2));
+	}
+
 	void _SetZoom(int z)
 	{
 		if (z != fZoom) {
@@ -1150,26 +1830,93 @@ private:
 		SetDrawingMode(B_OP_ALPHA);
 		SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
 		BFont font(be_bold_font);
+		fHits.clear();
+		// Each marker where its places are; markers that would overlap are
+		// pushed apart a few times, so none hides another.
+		std::vector<std::pair<Group*, BPoint> > at;
 		for (auto& e : groups) {
-			Group& g = e.second;
 			double sx = 0, sy = 0;
-			for (const Place* p : g.members) {
+			for (const Place* p : e.second.members) {
 				sx += WorldX(p->lon, fZoom) - left;
 				sy += WorldY(p->lat, fZoom) - top;
 			}
-			BPoint c(sx / g.members.size(), sy / g.members.size());
-			const float r = 14;
-			SetHighColor(0, 0, 0, 60);
-			FillEllipse(c + BPoint(0, 1.5), r + 1, r + 1);
-			SetHighColor(255, 255, 255);
-			FillEllipse(c, r + 1.5, r + 1.5);
-			SetHighColor(KindColor(g.kind));
-			FillEllipse(c, r, r);
-			font.SetSize(13);
-			SetFont(&font);
-			SetHighColor(255, 255, 255);
-			const char* glyph = KindGlyph(g.kind);
-			DrawString(glyph, c - BPoint(font.StringWidth(glyph) / 2, -5));
+			size_t n = e.second.members.size();
+			at.push_back(std::make_pair(&e.second, BPoint(sx / n, sy / n)));
+		}
+		const float apart = 48;
+		for (int round = 0; round < 8; round++) {
+			bool moved = false;
+			for (size_t i = 0; i < at.size(); i++) {
+				for (size_t j = i + 1; j < at.size(); j++) {
+					BPoint d = at[j].second - at[i].second;
+					float len = sqrtf(d.x * d.x + d.y * d.y);
+					if (len >= apart)
+						continue;
+					if (len < 0.5) {
+						double a = 2 * M_PI * (j % 6) / 6;
+						d = BPoint(cos(a), sin(a));
+						len = 1;
+					}
+					float push = (apart - len) / 2 / len;
+					at[i].second -= BPoint(d.x * push, d.y * push);
+					at[j].second += BPoint(d.x * push, d.y * push);
+					moved = true;
+				}
+			}
+			if (!moved)
+				break;
+		}
+		for (auto& a : at) {
+			Group& g = *a.first;
+			BPoint c = a.second;
+			float r = 14;
+			// A photo: its thumbnail (asked for once), in a white frame.
+			BBitmap* thumb = NULL;
+			if (g.kind == "photo") {
+				for (const Place* p : g.members) {
+					if (!p->hasThumb)
+						continue;
+					auto it = fThumbs.find(p->index);
+					if (it != fThumbs.end()) {
+						thumb = it->second;
+						break;
+					}
+					if (fThumbAsked.insert(p->index).second && !fWorkers.empty()) {
+						BMessage ask(kThumb);
+						ask.AddInt32("i", p->index);
+						fWorkers[fThumbAsked.size() % fWorkers.size()]->PostMessage(&ask);
+					}
+					break;
+				}
+			}
+			if (thumb != NULL) {
+				r = 20;
+				BRect frame(c.x - r, c.y - r, c.x + r, c.y + r);
+				SetHighColor(0, 0, 0, 70);
+				FillRoundRect(frame.OffsetByCopy(0, 2).InsetByCopy(-2, -2), 5, 5);
+				SetHighColor(255, 255, 255);
+				FillRoundRect(frame.InsetByCopy(-2, -2), 5, 5);
+				SetDrawingMode(B_OP_COPY);
+				DrawBitmap(thumb, thumb->Bounds(), frame.InsetByCopy(1, 1));
+				SetDrawingMode(B_OP_ALPHA);
+			} else {
+				SetHighColor(0, 0, 0, 60);
+				FillEllipse(c + BPoint(0, 1.5), r + 1, r + 1);
+				SetHighColor(255, 255, 255);
+				FillEllipse(c, r + 1.5, r + 1.5);
+				SetHighColor(KindColor(g.kind));
+				FillEllipse(c, r, r);
+				font.SetSize(13);
+				SetFont(&font);
+				SetHighColor(255, 255, 255);
+				const char* glyph = KindGlyph(g.kind);
+				DrawString(glyph, c - BPoint(font.StringWidth(glyph) / 2, -5));
+			}
+			Hit hit;
+			hit.center = c;
+			hit.radius = r + 3;
+			hit.members = g.members;
+			fHits.push_back(hit);
 			if (g.members.size() > 1) {
 				BString count;
 				size_t n = g.members.size();
@@ -1258,6 +2005,10 @@ private:
 	std::vector<TileWorker*> fWorkers;
 	std::vector<Place> fPlaces;
 	std::set<BString> fHidden;
+	std::map<int32, BBitmap*> fThumbs;
+	std::set<int32> fThumbAsked;
+	std::vector<Hit> fHits;
+	Bubble* fBubble = NULL;
 	bool fDragging, fMoved;
 	BPoint fLast;
 	size_t fNextWorker;
@@ -1547,6 +2298,8 @@ public:
 			.End();
 		fMap->SetExplicitMinSize(BSize(500, 400));
 		fSearch->SetModificationMessage(NULL);
+		fSearch->SetMessage(new BMessage(kSearch));
+		fSearch->SetToolTip("An address or a place: Enter searches");
 
 		fWorker = new Worker(BMessenger(this));
 		fWorker->Run();
@@ -1707,6 +2460,44 @@ public:
 				fLeaving = "";
 				break;
 			}
+			case kSearch:
+			{
+				BString text(fSearch->Text());
+				if (text.Trim().IsEmpty())
+					break;
+				BMessage find(kFind);
+				find.AddString("text", text);
+				fWorker->PostMessage(&find);
+				fStatus->SetText(BString("Searching ") << text << "…");
+				break;
+			}
+			case kFound:
+				_ShowFound(*message);
+				break;
+			case kPick:
+				fMap->CenterOn(message->GetDouble("lat", 0),
+					message->GetDouble("lon", 0),
+					(int)round(message->GetDouble("zoom", 15)));
+				if (message->GetInt32("place", -1) >= 0)
+					fMap->OpenBubble(message->GetInt32("place", -1));
+				break;
+			case kOpenPhoto:
+				fMap->OpenPhoto();
+				break;
+			case kViewChanged:
+				_AskPlacesIn();
+				break;
+			case kPlacesFound:
+			{
+				BMessage places;
+				message->FindMessage("places", &places);
+				if (places.HasString("error") || Count(places) == 0)
+					break;
+				for (int32 i = 0; i < Count(places); i++)
+					fNextPlaces.push_back(_Place(Item(places, i)));
+				fMap->SetPlaces(fNextPlaces);
+				break;
+			}
 			case kKeep:
 			{
 				BString ns = message->GetString("ns", "");
@@ -1849,20 +2640,8 @@ private:
 			name << Count(fNext);
 			fNext.AddMessage(name.String(), new BMessage(Item(tilesets, i)));
 		}
-		for (int32 i = 0; i < Count(places); i++) {
-			BMessage m = Item(places, i);
-			Place p;
-			p.index = (int32)m.GetDouble("i", i);
-			p.ns = m.GetString("ns", "");
-			p.id = m.GetString("id", "");
-			p.kind = m.GetString("kind", "place");
-			p.title = m.GetString("title", "");
-			p.lat = m.GetDouble("lat", 0);
-			p.lon = m.GetDouble("lon", 0);
-			p.hasMinZoom = m.HasDouble("minzoom");
-			p.minZoom = m.GetDouble("minzoom", 0);
-			fNextPlaces.push_back(p);
-		}
+		for (int32 i = 0; i < Count(places); i++)
+			fNextPlaces.push_back(_Place(Item(places, i)));
 		if (data.GetBool("by_cell", false))
 			fNextByCell.insert(ns);
 		fInfo[ns] = data;
@@ -1874,6 +2653,79 @@ private:
 		status << fNextPlaces.size() << " place(s)";
 		fStatus->SetText(status);
 		_ShowFirstMap();
+	}
+
+	static Place _Place(const BMessage& m)
+	{
+		Place p;
+		p.index = (int32)m.GetDouble("i", 0);
+		p.ns = m.GetString("ns", "");
+		p.id = m.GetString("id", "");
+		p.kind = m.GetString("kind", "place");
+		p.title = m.GetString("title", "");
+		p.detail = m.GetString("detail", "");
+		p.hasThumb = m.GetBool("thumb", false);
+		p.lat = m.GetDouble("lat", 0);
+		p.lon = m.GetDouble("lon", 0);
+		p.hasMinZoom = m.HasDouble("minzoom");
+		p.minZoom = m.GetDouble("minzoom", 0);
+		return p;
+	}
+
+	/*! A lazy library's places (a map's cafés) are asked for by area, once
+		zoomed in enough to show them (zoom 12 and closer). */
+	void _AskPlacesIn()
+	{
+		int zoom = fMap->Zoom();
+		if (zoom < 12)
+			return;
+		double w, s, e, n;
+		fMap->Area(&w, &s, &e, &n);
+		for (const BString& ns : fNextByCell) {
+			if (fHidden.find(ns) != fHidden.end())
+				continue;
+			BMessage ask(kPlacesIn);
+			ask.AddString("ns", ns);
+			ask.AddDouble("w", w);
+			ask.AddDouble("s", s);
+			ask.AddDouble("e", e);
+			ask.AddDouble("n", n);
+			ask.AddInt32("zoom", zoom);
+			fWorker->PostMessage(&ask);
+		}
+	}
+
+	/*! What a search found, as a menu under the search field. */
+	void _ShowFound(const BMessage& message)
+	{
+		BMessage found;
+		message.FindMessage("found", &found);
+		if (found.HasString("error")) {
+			fStatus->SetText(found.GetString("error", ""));
+			return;
+		}
+		int32 count = Count(found);
+		BString status;
+		status << count << " found";
+		fStatus->SetText(count == 0 ? BString("Nothing found") : status);
+		if (count == 0)
+			return;
+		BPopUpMenu* menu = new BPopUpMenu("found", false, false);
+		for (int32 i = 0; i < count && i < 15; i++) {
+			BMessage f = Item(found, i);
+			BMessage* pick = new BMessage(kPick);
+			pick->AddDouble("lat", f.GetDouble("lat", 0));
+			pick->AddDouble("lon", f.GetDouble("lon", 0));
+			pick->AddDouble("zoom", f.GetDouble("zoom", 15));
+			pick->AddInt32("place", f.HasDouble("place")
+				? (int32)f.GetDouble("place", -1) : -1);
+			menu->AddItem(new BMenuItem(f.GetString("name", "?"), pick));
+		}
+		menu->SetTargetForItems(this);
+		BPoint where = fSearch->Bounds().LeftBottom();
+		fSearch->ConvertToScreen(&where);
+		menu->SetAsyncAutoDestruct(true);
+		menu->Go(where, true, false, true);
 	}
 
 	/*! A checkbox per library with something the map shows: a map (its

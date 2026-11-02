@@ -313,6 +313,18 @@ pub unsafe extern "C" fn rm_thumb(i: c_int, len: *mut usize) -> *mut u8 {
     }
 }
 
+/// A photo's larger preview (1600 px; else its thumbnail): image bytes, or
+/// null. Freed with `rm_free_bytes`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rm_preview(i: c_int, len: *mut usize) -> *mut u8 {
+    let p = state().places.get(i.max(0) as usize).cloned();
+    let m = map();
+    match p.and_then(|p| p.preview.clone().or_else(|| p.thumb.clone()).and_then(|cap| m.image(&p.ns, &cap, 8 << 20))) {
+        Some(b) => bytes(b, len),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// A record's attributes for its bubble: `[[key, value]]`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rm_details(ns: *const c_char, id: *const c_char) -> *mut c_char {

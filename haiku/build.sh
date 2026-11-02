@@ -19,7 +19,7 @@ cp target/release/libretifs_map.so "$OUT/lib/"
 rm -f "${OUT:?}/Map"
 g++ -O2 -std=c++17 -Wall -o "$OUT/Map" "$HERE/app/MapApp.cpp" \
 	-I "$HERE/capi" -I /boot/system/develop/headers/private/shared \
-	-L "$OUT/lib" -lretifs_map -lbe -lshared \
+	-L "$OUT/lib" -lretifs_map -lbe -lshared -ltranslation \
 	-Wl,-rpath,'$ORIGIN/lib'
 rc -o "$HERE/build/map.rsrc" "$HERE/app/map.rdef"
 xres -o "$OUT/Map" "$HERE/build/map.rsrc"

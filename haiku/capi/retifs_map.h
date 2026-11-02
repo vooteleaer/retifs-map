@@ -36,6 +36,8 @@ char* rm_places_in(const char* ns, double west, double south, double east,
 char* rm_style(const char* tileset);
 uint8_t* rm_tile(const char* tileset, int z, int x, int y, size_t* len);
 uint8_t* rm_thumb(int place, size_t* len);
+/* A photo's larger preview (else its thumbnail), as image bytes. */
+uint8_t* rm_preview(int place, size_t* len);
 char* rm_details(const char* ns, const char* id);
 char* rm_find(const char* text);
 char* rm_save_place(const char* ns, const char* name, double lat, double lon,
