@@ -140,6 +140,60 @@ pub extern "C" fn rm_load() -> *mut c_char {
     out(v)
 }
 
+/// The libraries to read, one by one (`rm_library`), so the window shows
+/// each as it comes and how far it is: `{"libraries", "lazy", "address"}`
+/// or `{"error"}`. Forgets what was read before.
+#[unsafe(no_mangle)]
+pub extern "C" fn rm_libraries() -> *mut c_char {
+    let m = map();
+    let libraries = match m.libraries() {
+        Ok(l) => l,
+        Err(e) => return out(json!({ "error": e })),
+    };
+    let lazy = m.lazy(&libraries);
+    let address = m.address_libraries(&libraries);
+    let mut s = state();
+    s.libraries = libraries.clone();
+    s.tilesets.clear();
+    s.places.clear();
+    out(json!({ "libraries": libraries, "lazy": lazy, "address": address }))
+}
+
+/// One library read: `{"ns", "tilesets": […], "places": […], "unplaced": […],
+/// "by_cell"}` (as in `rm_load`; "by_cell": held lazily, with places asked
+/// for by area). Its places and maps are added to those kept.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rm_library(ns: *const c_char, lazy: c_int) -> *mut c_char {
+    let ns = unsafe { arg(ns) };
+    let m = map();
+    let one = [ns.clone()];
+    let tilesets = m.tilesets(&one);
+    let by_cell = lazy != 0 && !m.place_libraries(&one).is_empty();
+    let (places, unplaced) = if lazy != 0 { Default::default() } else { m.places(&one).unwrap_or_default() };
+    let info = m.info(&ns).ok();
+    let mut s = state();
+    let first = s.places.len();
+    let v = json!({
+        "ns": ns,
+        "by_cell": by_cell,
+        "records": info.as_ref().map_or(0, |v| v.records),
+        "peers": info.as_ref().map_or(0, |v| v.peers),
+        "lazy": info.as_ref().is_some_and(|v| v.lazy),
+        "writable": info.as_ref().is_some_and(|v| v.writers.iter().any(|(w, _)| *w == v.own_writer)),
+        "tilesets": tilesets.iter().map(|t| json!({
+            "ns": t.ns, "id": t.id, "name": t.name, "bounds": t.bounds, "minzoom": t.minzoom,
+            "maxzoom": t.maxzoom, "overlay": t.overlay, "attribution": t.attribution,
+        })).collect::<Vec<_>>(),
+        "places": places.iter().enumerate().map(|(i, p)| place_json(first + i, p)).collect::<Vec<_>>(),
+        "unplaced": unplaced.iter().map(|u| json!({
+            "ns": u.ns, "id": u.id, "kind": kind(u.kind), "title": u.title, "key": u.key, "address": u.address,
+        })).collect::<Vec<_>>(),
+    });
+    s.tilesets.extend(tilesets);
+    s.places.extend(places);
+    out(v)
+}
+
 /// The places of a lazily held library around a view (zoom-12 and zoom-14
 /// cells, as the GTK app asks), added to those kept: `[{place…}]`.
 #[unsafe(no_mangle)]

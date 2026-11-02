@@ -20,6 +20,12 @@
 #include <ScrollView.h>
 #include <SeparatorView.h>
 #include <SpaceLayoutItem.h>
+#include <StatusBar.h>
+#include <Alert.h>
+#include <Invoker.h>
+#include <MenuItem.h>
+#include <MessageFilter.h>
+#include <PopUpMenu.h>
 #include <Shape.h>
 #include <StringView.h>
 #include <TextControl.h>
@@ -62,6 +68,14 @@ enum {
 	kJoinHeard = 'jhrd',	// worker: join one ("address")
 	kJoined = 'jond',
 	kReload = 'rlod',		// window: read everything again
+	kLoadStart = 'lsta',	// window: the libraries to read
+	kLoadStep = 'lstp',		// window: reading this one now
+	kLoadLibrary = 'llib',	// window: one read
+	kLoadDone = 'ldon',
+	kToggle = 'togl',		// window: show or hide a library ("ns")
+	kLeaveAsk = 'leva',		// window: leave a library? ("ns")
+	kLeave = 'leav',		// worker: leave it ("ns")
+	kLeft = 'left',			// window: left ("result")
 };
 
 static const int kTileSize = 256;
@@ -440,9 +454,39 @@ public:
 		switch (message->what) {
 			case kLoad:
 			{
-				BMessage loaded(kLoaded);
-				loaded.AddMessage("data", new BMessage(Take(rm_load())));
-				fTarget.SendMessage(&loaded);
+				// One by one: the window shows each as it comes, and how far.
+				BMessage list = Take(rm_libraries());
+				BMessage start(kLoadStart);
+				start.AddMessage("list", &list);
+				fTarget.SendMessage(&start);
+				if (list.HasString("error"))
+					break;
+				BMessage libraries, lazy, address;
+				list.FindMessage("libraries", &libraries);
+				list.FindMessage("lazy", &lazy);
+				list.FindMessage("address", &address);
+				std::set<BString> lazySet, skip;
+				for (int32 i = 0; i < Count(lazy); i++)
+					lazySet.insert(_Name(lazy, i));
+				for (int32 i = 0; i < Count(address); i++)
+					skip.insert(_Name(address, i));
+				int32 total = Count(libraries);
+				for (int32 i = 0; i < total; i++) {
+					BString ns = _Name(libraries, i);
+					BMessage step(kLoadStep);
+					step.AddString("ns", ns);
+					step.AddInt32("i", i);
+					step.AddInt32("total", total);
+					fTarget.SendMessage(&step);
+					// A gazetteer is only searched.
+					if (skip.find(ns) != skip.end())
+						continue;
+					BMessage one(kLoadLibrary);
+					one.AddMessage("data", new BMessage(Take(rm_library(ns.String(),
+						lazySet.find(ns) != lazySet.end() ? 1 : 0))));
+					fTarget.SendMessage(&one);
+				}
+				fTarget.SendMessage(kLoadDone);
 				break;
 			}
 			case kStyle:
@@ -475,6 +519,15 @@ public:
 				fTarget.SendMessage(kReload);
 				break;
 			}
+			case kLeave:
+			{
+				BMessage left(kLeft);
+				left.AddString("ns", message->GetString("ns", ""));
+				left.AddMessage("result", new BMessage(Take(
+					rm_leave(message->GetString("ns", "")))));
+				fTarget.SendMessage(&left);
+				break;
+			}
 			case kChanges:
 			{
 				BMessage changed(kChanged);
@@ -488,8 +541,91 @@ public:
 	}
 
 private:
+	static BString _Name(const BMessage& array, int32 i)
+	{
+		BString name;
+		name << i;
+		return array.GetString(name.String(), "");
+	}
+
 	BMessenger fTarget;
 };
+
+
+// #pragma mark - Library box
+
+
+/*! A library in the sidebar: a small box with its name (a checkbox: shown
+	on the map or not) and, under it, what's known of it (a map, how many
+	records and peers). Right-click for what can be done with it. */
+class LibraryItem : public BView {
+public:
+	LibraryItem(const BString& ns, const BString& detail, bool shown,
+		BHandler* target)
+		:
+		BView(ns.String(), B_WILL_DRAW | B_FRAME_EVENTS),
+		fNs(ns)
+	{
+		SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+		BMessage* toggle = new BMessage(kLibraries);
+		fCheck = new BCheckBox(ns.String(), ns.String(), toggle);
+		fCheck->SetValue(shown ? B_CONTROL_ON : B_CONTROL_OFF);
+		fCheck->SetTarget(target);
+		fDetail = new BStringView(NULL, detail.String());
+		BFont small(be_plain_font);
+		small.SetSize(small.Size() * 0.85);
+		fDetail->SetFont(&small);
+		fDetail->SetHighColor(mix_color(ui_color(B_PANEL_TEXT_COLOR),
+			ui_color(B_PANEL_BACKGROUND_COLOR), 150));
+		fDetail->SetTruncation(B_TRUNCATE_END);
+		float em = be_plain_font->Size();
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+			.SetInsets(em * 0.4, em * 0.25, em * 0.4, em * 0.35)
+			.Add(fCheck)
+			.AddGroup(B_HORIZONTAL, 0)
+				.SetInsets(em * 1.6, 0, 0, 0)
+				.Add(fDetail)
+			.End();
+	}
+
+	const BString& Ns() const { return fNs; }
+	BCheckBox* Check() const { return fCheck; }
+
+	void Draw(BRect)
+	{
+		BRect r = Bounds().InsetByCopy(0.5, 0.5);
+		SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR),
+			B_DARKEN_2_TINT));
+		StrokeRoundRect(r, 4, 4);
+	}
+
+	void FrameResized(float, float)
+	{
+		Invalidate();
+	}
+
+private:
+	BString fNs;
+	BCheckBox* fCheck;
+	BStringView* fDetail;
+};
+
+
+/*! "95,335": a count, its thousands set apart. */
+static BString
+Grouped(int64 n)
+{
+	BString digits;
+	digits << n;
+	BString out;
+	int32 length = digits.Length();
+	for (int32 i = 0; i < length; i++) {
+		if (i > 0 && (length - i) % 3 == 0)
+			out << ",";
+		out << digits.ByteAt(i);
+	}
+	return out;
+}
 
 
 // #pragma mark - Places
@@ -1355,6 +1491,7 @@ public:
 		fSearch->TextView()->SetExplicitMinSize(BSize(300, B_SIZE_UNSET));
 		fAdd = new BButton("add", "+", NULL);
 		fAdd->SetToolTip("Add a place");
+		AddCommonFilter(new BMessageFilter(B_MOUSE_DOWN, &_RightClick));
 		fAnnounces = new BButton("announces", "Announces", new BMessage(kAnnounces));
 		fAnnounces->SetToolTip("Public libraries heard on the network");
 		fAnnounces->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
@@ -1365,6 +1502,8 @@ public:
 		fStatus->SetFont(&small);
 
 		fLibraries = new BGroupView(B_VERTICAL, 2);
+		fReading = new BStatusBar("reading", "Reading libraries…");
+		fReading->SetBarHeight(8);
 
 		BGroupView* side = new BGroupView(B_VERTICAL, B_USE_DEFAULT_SPACING);
 		BLayoutBuilder::Group<>(side)
@@ -1372,10 +1511,13 @@ public:
 			.Add(fAnnounces)
 			.Add(_Heading("Libraries"))
 			.Add(fLibraries)
+			.Add(fReading)
 			.AddGlue()
 			.Add(fStatus);
-		side->SetExplicitMinSize(BSize(240, B_SIZE_UNSET));
-		side->SetExplicitMaxSize(BSize(320, B_SIZE_UNLIMITED));
+		// Wide enough for its text at any font size; the map takes the rest.
+		float em = be_plain_font->Size();
+		side->SetExplicitMinSize(BSize(em * 18, B_SIZE_UNSET));
+		side->SetExplicitMaxSize(BSize(em * 30, B_SIZE_UNLIMITED));
 
 		BLayoutBuilder::Group<>(this, B_HORIZONTAL, 0)
 			.Add(side)
@@ -1431,13 +1573,46 @@ public:
 	void MessageReceived(BMessage* message)
 	{
 		switch (message->what) {
-			case kLoaded:
+			case kLoadStart:
+			{
+				BMessage list;
+				message->FindMessage("list", &list);
+				if (list.HasString("error")) {
+					fStatus->SetText(list.GetString("error", ""));
+					break;
+				}
+				fNext = BMessage();
+				fNextPlaces.clear();
+				fNextByCell.clear();
+				fReading->Reset("Reading libraries…");
+				fReading->SetMaxValue(std::max<int32>(1, Count(*_Find(list,
+					"libraries"))));
+				if (fReading->IsHidden())
+					fReading->Show();
+				break;
+			}
+			case kLoadStep:
+			{
+				BString text(message->GetString("ns", ""));
+				BString count;
+				count << (message->GetInt32("i", 0) + 1) << " of "
+					<< message->GetInt32("total", 0);
+				fReading->Update(fReading->CurrentValue() == 0 ? 0.0001f : 1.0f,
+					text.String(), count.String());
+				break;
+			}
+			case kLoadLibrary:
 			{
 				BMessage data;
 				message->FindMessage("data", &data);
-				_Loaded(data);
+				_AddLibrary(data);
 				break;
 			}
+			case kLoadDone:
+				fReading->Update(fReading->MaxValue() - fReading->CurrentValue());
+				if (!fReading->IsHidden())
+					fReading->Hide();
+				break;
 			case kStyled:
 			{
 				BMessage style;
@@ -1477,12 +1652,59 @@ public:
 				}
 				fHidden.clear();
 				for (int32 i = 0; i < fLibraries->CountChildren(); i++) {
-					BCheckBox* box = dynamic_cast<BCheckBox*>(fLibraries->ChildAt(i));
-					if (box != NULL && box->Value() != B_CONTROL_ON)
-						fHidden.insert(box->Name());
+					LibraryItem* item = dynamic_cast<LibraryItem*>(fLibraries->ChildAt(i));
+					if (item != NULL && item->Check()->Value() != B_CONTROL_ON)
+						fHidden.insert(item->Ns());
 				}
 				fMap->SetHidden(fHidden);
 				_ShowFirstMap();
+				break;
+			}
+			case kToggle:
+			{
+				LibraryItem* item = _Item(message->GetString("ns", ""));
+				if (item == NULL)
+					break;
+				item->Check()->SetValue(item->Check()->Value() == B_CONTROL_ON
+					? B_CONTROL_OFF : B_CONTROL_ON);
+				item->Check()->Invoke();
+				break;
+			}
+			case kLeaveAsk:
+			{
+				BString ns = message->GetString("ns", "");
+				BString text;
+				text << "Leave " << ns << "?\n\nIts records go from this device. "
+					"Others who have it keep theirs; you can join it again.";
+				BAlert* alert = new BAlert("Leave", text.String(), "Cancel",
+					"Leave", NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+				alert->SetShortcut(0, B_ESCAPE);
+				fLeaving = ns;
+				alert->Go(new BInvoker(new BMessage(kLeave), this));
+				break;
+			}
+			case kLeave:
+			{
+				// The alert's answer: 1 is "Leave".
+				if (message->GetInt32("which", 0) != 1 || fLeaving.IsEmpty())
+					break;
+				BMessage leave(kLeave);
+				leave.AddString("ns", fLeaving);
+				fWorker->PostMessage(&leave);
+				fStatus->SetText(BString("Leaving ") << fLeaving << "…");
+				fLeaving = "";
+				break;
+			}
+			case kLeft:
+			{
+				BMessage result;
+				message->FindMessage("result", &result);
+				if (result.HasString("error")) {
+					fStatus->SetText(result.GetString("error", ""));
+					break;
+				}
+				fHidden.erase(message->GetString("ns", ""));
+				fWorker->PostMessage(kLoad);
 				break;
 			}
 			case kChanged:
@@ -1502,7 +1724,60 @@ public:
 		}
 	}
 
+	/*! A right-click on a library: what can be done with it. */
+	bool LibraryMenu(BView* view, BPoint where)
+	{
+		LibraryItem* item = NULL;
+		for (BView* v = view; v != NULL && item == NULL; v = v->Parent())
+			item = dynamic_cast<LibraryItem*>(v);
+		if (item == NULL)
+			return false;
+		BPopUpMenu* menu = new BPopUpMenu("library", false, false);
+		BMessage* toggle = new BMessage(kToggle);
+		toggle->AddString("ns", item->Ns());
+		menu->AddItem(new BMenuItem(item->Check()->Value() == B_CONTROL_ON
+			? "Hide on the map" : "Show on the map", toggle));
+		menu->AddSeparatorItem();
+		BMessage* leave = new BMessage(kLeaveAsk);
+		leave->AddString("ns", item->Ns());
+		BMenuItem* leaveItem = new BMenuItem("Leave library…", leave);
+		// Your own library ("me") is this device's, not one joined.
+		leaveItem->SetEnabled(item->Ns() != "me");
+		menu->AddItem(leaveItem);
+		menu->SetTargetForItems(this);
+		view->ConvertToScreen(&where);
+		menu->SetAsyncAutoDestruct(true);
+		menu->Go(where, true, false, true);
+		return true;
+	}
+
 private:
+	static filter_result _RightClick(BMessage* message, BHandler** target,
+		BMessageFilter* filter)
+	{
+		int32 buttons = message->GetInt32("buttons", 0);
+		if ((buttons & B_SECONDARY_MOUSE_BUTTON) == 0)
+			return B_DISPATCH_MESSAGE;
+		BView* view = dynamic_cast<BView*>(*target);
+		MapWindow* window = dynamic_cast<MapWindow*>(filter->Looper());
+		BPoint where;
+		if (view == NULL || window == NULL
+			|| message->FindPoint("be:view_where", &where) != B_OK)
+			return B_DISPATCH_MESSAGE;
+		return window->LibraryMenu(view, where)
+			? B_SKIP_MESSAGE : B_DISPATCH_MESSAGE;
+	}
+
+	LibraryItem* _Item(const BString& ns)
+	{
+		for (int32 i = 0; i < fLibraries->CountChildren(); i++) {
+			LibraryItem* item = dynamic_cast<LibraryItem*>(fLibraries->ChildAt(i));
+			if (item != NULL && item->Ns() == ns)
+				return item;
+		}
+		return NULL;
+	}
+
 	BStringView* _Heading(const char* text)
 	{
 		BStringView* v = new BStringView(NULL, text);
@@ -1521,18 +1796,20 @@ private:
 		return a.CountNames(B_ANY_TYPE) == b.CountNames(B_ANY_TYPE);
 	}
 
-	void _Loaded(const BMessage& data)
+	/*! One library read: its maps and places join those shown, at once
+		(the next load builds up in fNext while the old one stays shown,
+		so an update doesn't empty the window). */
+	void _AddLibrary(const BMessage& data)
 	{
-		if (data.HasString("error")) {
-			fStatus->SetText(data.GetString("error", ""));
-			return;
-		}
-		data.FindMessage("tilesets", &fTilesets);
-		BMessage places, unplaced;
+		BString ns = data.GetString("ns", "");
+		BMessage tilesets, places;
+		data.FindMessage("tilesets", &tilesets);
 		data.FindMessage("places", &places);
-		data.FindMessage("unplaced", &unplaced);
-
-		std::vector<Place> list;
+		for (int32 i = 0; i < Count(tilesets); i++) {
+			BString name;
+			name << Count(fNext);
+			fNext.AddMessage(name.String(), new BMessage(Item(tilesets, i)));
+		}
 		for (int32 i = 0; i < Count(places); i++) {
 			BMessage m = Item(places, i);
 			Place p;
@@ -1545,49 +1822,39 @@ private:
 			p.lon = m.GetDouble("lon", 0);
 			p.hasMinZoom = m.HasDouble("minzoom");
 			p.minZoom = m.GetDouble("minzoom", 0);
-			list.push_back(p);
+			fNextPlaces.push_back(p);
 		}
-		fMap->SetPlaces(list);
+		if (data.GetBool("by_cell", false))
+			fNextByCell.insert(ns);
+		fInfo[ns] = data;
+		fTilesets = fNext;
+		fMap->SetPlaces(fNextPlaces);
 		fMap->SetHidden(fHidden);
-		_FillLibraries(data, list);
-
+		_FillLibraries();
 		BString status;
-		status << list.size() << " place(s) in "
-			<< Count(*_Find(data, "libraries")) << " libraries";
+		status << fNextPlaces.size() << " place(s)";
 		fStatus->SetText(status);
-
 		_ShowFirstMap();
 	}
 
 	/*! A checkbox per library with something the map shows: a map (its
-		tiles), places, places held lazily (a map's cafés). None for a library
-		with nothing to put on a map, or a gazetteer (only searched). */
-	void _FillLibraries(const BMessage& data, const std::vector<Place>& places)
+		tiles), places, places held lazily by cell (a map's cafés). None for
+		a library with nothing to put on a map, or a gazetteer (only
+		searched). */
+	void _FillLibraries()
 	{
 		std::map<BString, int32> counts;
-		for (const Place& p : places)
+		for (const Place& p : fNextPlaces)
 			counts[p.ns]++;
-		BMessage lazy, address;
-		// Held lazily, a library's places are known only by its index.
-		data.FindMessage("lazy_places", &lazy);
-		data.FindMessage("address", &address);
-		std::set<BString> maps, skip;
+		std::set<BString> maps;
 		for (int32 i = 0; i < Count(fTilesets); i++) {
 			BString ns = Item(fTilesets, i).GetString("ns", "");
 			maps.insert(ns);
 			if (counts.find(ns) == counts.end())
 				counts[ns] = 0;
 		}
-		for (int32 i = 0; i < Count(address); i++) {
-			BString name;
-			name << i;
-			skip.insert(address.GetString(name.String(), ""));
-		}
-		for (int32 i = 0; i < Count(lazy); i++) {
-			BString name;
-			name << i;
-			BString ns = lazy.GetString(name.String(), "");
-			if (skip.find(ns) == skip.end() && counts.find(ns) == counts.end())
+		for (const BString& ns : fNextByCell) {
+			if (counts.find(ns) == counts.end())
 				counts[ns] = -1;
 		}
 		while (fLibraries->CountChildren() > 0) {
@@ -1596,17 +1863,20 @@ private:
 			delete v;
 		}
 		for (auto& c : counts) {
-			BString label(c.first);
+			const BMessage& info = fInfo[c.first];
+			BString detail;
 			if (maps.find(c.first) != maps.end())
-				label << "  ·  map";
+				detail << "map  ·  ";
 			if (c.second > 0)
-				label << "  ·  " << c.second;
-			BCheckBox* box = new BCheckBox(c.first.String(), label.String(),
-				new BMessage(kLibraries));
-			box->SetValue(fHidden.find(c.first) == fHidden.end()
-				? B_CONTROL_ON : B_CONTROL_OFF);
-			box->SetTarget(this);
-			fLibraries->AddChild(box);
+				detail << Grouped(c.second) << " on the map  ·  ";
+			int64 records = (int64)info.GetDouble("records", 0);
+			detail << Grouped(records) << (records == 1 ? " record" : " records");
+			if (info.GetBool("lazy", false))
+				detail << " here";
+			int32 peers = (int32)info.GetDouble("peers", 0);
+			detail << "  ·  " << peers << (peers == 1 ? " peer" : " peers");
+			fLibraries->AddChild(new LibraryItem(c.first, detail,
+				fHidden.find(c.first) == fHidden.end(), this));
 		}
 		if (counts.empty())
 			fLibraries->AddChild(new BStringView(NULL, "None with places yet"));
@@ -1676,6 +1946,12 @@ private:
 	BButton* fAnnounces;
 	BStringView* fStatus;
 	BGroupView* fLibraries;
+	BStatusBar* fReading;
+	BMessage fNext;
+	std::vector<Place> fNextPlaces;
+	std::set<BString> fNextByCell;
+	std::map<BString, BMessage> fInfo;
+	BString fLeaving;
 	std::set<BString> fHidden;
 	std::list<BString> fMapOrder;
 	bool fZoomed = false;

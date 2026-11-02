@@ -672,6 +672,15 @@ impl Map {
     }
 
     /// Leaves a joined library on this device (others keep their copies).
+    /// What's known of a library here: its records, peers, how it's held.
+    pub fn info(&self, ns: &str) -> Result<libretifs::NsView, String> {
+        let mut c = self.client()?;
+        match self.call(&mut c, Request::NsInfo { ns: ns.into() })? {
+            Response::Namespace(v) => Ok(v),
+            _ => Err("unexpected answer".into()),
+        }
+    }
+
     pub fn leave(&self, ns: &str) -> Result<(), String> {
         let mut c = self.client()?;
         self.call(&mut c, Request::NsLeave { ns: ns.into(), mine: false }).map(|_| ())

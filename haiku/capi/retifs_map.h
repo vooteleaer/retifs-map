@@ -25,6 +25,11 @@ extern "C" {
 #endif
 
 char* rm_load(void);
+/* The libraries to read one by one: {"libraries", "lazy", "address"}. */
+char* rm_libraries(void);
+/* One library: {"ns", "tilesets", "places", "unplaced", "by_cell", "records",
+ * "peers", "lazy", "writable"}. */
+char* rm_library(const char* ns, int lazy);
 char* rm_places_in(const char* ns, double west, double south, double east,
 	double north, int zoom);
 /* {"background"} or {"error"}: read once before the map's tiles. */
