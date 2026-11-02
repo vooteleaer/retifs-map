@@ -296,16 +296,22 @@ pub unsafe extern "C" fn rm_place(ns: *const c_char, id: *const c_char, key: *co
     done(map().place(&ns, &id, &key, lat, lon).map(|()| json!({})))
 }
 
-/// Public libraries heard that the map shows something of: `[{"name",
-/// "about", "address", "here", "hops", "has": [[type, count]], "bounds"}]`.
+/// Public libraries heard on the network (ADR-0029), those the map can use
+/// (or can't read yet): `{"usable": [{"name", "about", "address", "here",
+/// "hops", "node", "heard_ms", "readable", "v", "fmt", "has": [[type,
+/// count]], "bounds"}], "other": count}`, or `{"error"}`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rm_heard() -> *mut c_char {
     done(map().heard().map(|list| {
-        json!(list
-            .iter()
-            .filter(|l| retifs_map_core::map_uses(l))
-            .map(|l| json!({ "name": l.name, "about": l.about, "address": l.address, "here": l.here, "hops": l.hops, "has": l.has, "bounds": l.bounds }))
-            .collect::<Vec<_>>())
+        let (usable, other): (Vec<_>, Vec<_>) = list.into_iter().partition(|l| !l.readable || retifs_map_core::map_uses(l));
+        json!({
+            "usable": usable.iter().map(|l| json!({
+                "name": l.name, "about": l.about, "address": l.address, "here": l.here,
+                "hops": l.hops, "node": l.node, "heard_ms": l.heard_ms, "readable": l.readable,
+                "v": l.v, "fmt": l.fmt, "has": l.has, "bounds": l.bounds,
+            })).collect::<Vec<_>>(),
+            "other": other.len(),
+        })
     }))
 }
 

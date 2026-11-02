@@ -18,6 +18,7 @@
 #include <RadioButton.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
+#include <SpaceLayoutItem.h>
 #include <Shape.h>
 #include <StringView.h>
 #include <TextControl.h>
@@ -53,6 +54,12 @@ enum {
 	kZoomOut = 'zmou',
 	kChanges = 'chng',
 	kChanged = 'chgd',
+	kAnnounces = 'annc',	// window: open the announces
+	kHeard = 'herd',		// worker: the libraries heard ("reply": where to)
+	kHeardDone = 'hrdd',
+	kJoinHeard = 'jhrd',	// worker: join one ("address")
+	kJoined = 'jond',
+	kReload = 'rlod',		// window: read everything again
 };
 
 static const int kTileSize = 256;
@@ -443,6 +450,27 @@ public:
 				styled.AddMessage("style",
 					new BMessage(Take(rm_style(message->GetString("map", "")))));
 				fTarget.SendMessage(&styled);
+				break;
+			}
+			case kHeard:
+			{
+				BMessenger reply;
+				message->FindMessenger("reply", &reply);
+				BMessage heard(kHeardDone);
+				heard.AddMessage("heard", new BMessage(Take(rm_heard())));
+				reply.SendMessage(&heard);
+				break;
+			}
+			case kJoinHeard:
+			{
+				BMessenger reply;
+				message->FindMessenger("reply", &reply);
+				BMessage joined(kJoined);
+				joined.AddString("address", message->GetString("address", ""));
+				joined.AddMessage("result", new BMessage(Take(
+					rm_join(message->GetString("address", "")))));
+				reply.SendMessage(&joined);
+				fTarget.SendMessage(kReload);
 				break;
 			}
 			case kChanges:
@@ -1086,6 +1114,228 @@ private:
 };
 
 
+// #pragma mark - Announces
+
+
+/*! "map · 38822 places · 120 photos": what of a library the map shows. */
+static BString
+Holds(const BMessage& has)
+{
+	BString out;
+	for (int32 i = 0; i < Count(has); i++) {
+		BMessage pair = Item(has, i);
+		BString type = pair.GetString("0", "");
+		int64 n = (int64)pair.GetDouble("1", 0);
+		BString word;
+		if (type == "application/x-vnd.retifs.tileset")
+			word = "map";
+		else if (type == "application/vnd.mapbox-vector-tile")
+			word << n << " map tiles";
+		else if (type == "application/x-vnd.retifs.place")
+			word << n << " places";
+		else if (type.StartsWith("image/"))
+			word << n << " photos";
+		else if (type == "application/x-person" || type == "contact")
+			word << n << " contacts";
+		else if (type == "text/calendar" || type == "event")
+			word << n << " events";
+		if (word.IsEmpty())
+			continue;
+		if (!out.IsEmpty())
+			out << " · ";
+		out << word;
+	}
+	return out;
+}
+
+
+static BString
+Ago(double ms)
+{
+	double s = (real_time_clock_usecs() / 1000.0 - ms) / 1000.0;
+	BString out;
+	if (s < 60)
+		out = "just now";
+	else if (s < 3600)
+		out << (int32)(s / 60) << " min ago";
+	else
+		out << (int32)(s / 3600) << " h ago";
+	return out;
+}
+
+
+/*!	Announces, as in LXMF apps (and the Linux map): the public libraries
+	heard on the network that the map can use, each with Join. Read again
+	every 5 s while open: announces keep coming.
+*/
+class AnnouncesWindow : public BWindow {
+public:
+	AnnouncesWindow(BLooper* worker)
+		:
+		BWindow(BRect(200, 120, 820, 700), "Announces", B_TITLED_WINDOW,
+			B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
+		fWorker(worker)
+	{
+		BStringView* intro = new BStringView("intro", "Public libraries heard "
+			"on the network. Joining fetches only what you look at.");
+		fList = new BGroupView(B_VERTICAL, B_USE_DEFAULT_SPACING);
+		fList->GroupLayout()->SetInsets(B_USE_DEFAULT_SPACING);
+		fList->SetViewUIColor(B_DOCUMENT_BACKGROUND_COLOR);
+		BScrollView* scroll = new BScrollView("scroll", fList, 0, false, true);
+		scroll->SetExplicitMinSize(BSize(580, 420));
+		fMore = new BStringView("more", "");
+		fMore->SetHighUIColor(B_PANEL_TEXT_COLOR, B_LIGHTEN_1_TINT);
+		BLayoutBuilder::Group<>(this, B_VERTICAL)
+			.SetInsets(B_USE_WINDOW_SPACING)
+			.Add(intro)
+			.Add(scroll)
+			.Add(fMore);
+		_Ask();
+		BMessage tick(kHeard);
+		tick.AddMessenger("reply", BMessenger(this));
+		fRunner = new BMessageRunner(BMessenger(fWorker), &tick, 5000000);
+	}
+
+	~AnnouncesWindow()
+	{
+		delete fRunner;
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kHeardDone:
+			{
+				BMessage heard;
+				message->FindMessage("heard", &heard);
+				_Fill(heard);
+				break;
+			}
+			case kJoinHeard:
+			{
+				BButton* b = NULL;
+				message->FindPointer("source", (void**)&b);
+				if (b != NULL) {
+					b->SetLabel("Joining…");
+					b->SetEnabled(false);
+				}
+				BMessage join(kJoinHeard);
+				join.AddString("address", message->GetString("address", ""));
+				join.AddMessenger("reply", BMessenger(this));
+				fWorker->PostMessage(&join);
+				break;
+			}
+			case kJoined:
+			{
+				BMessage result;
+				message->FindMessage("result", &result);
+				if (result.HasString("error")) {
+					fError = "Not joined: ";
+					fError << result.GetString("error", "");
+				} else
+					fError = "";
+				_Ask();
+				break;
+			}
+			default:
+				BWindow::MessageReceived(message);
+		}
+	}
+
+private:
+	void _Ask()
+	{
+		BMessage ask(kHeard);
+		ask.AddMessenger("reply", BMessenger(this));
+		fWorker->PostMessage(&ask);
+	}
+
+	void _Fill(const BMessage& heard)
+	{
+		while (fList->CountChildren() > 0) {
+			BView* v = fList->ChildAt(0);
+			fList->RemoveChild(v);
+			delete v;
+		}
+		while (fList->GroupLayout()->CountItems() > 0)
+			delete fList->GroupLayout()->RemoveItem((int32)0);
+		BMessage usable;
+		heard.FindMessage("usable", &usable);
+		if (Count(usable) == 0) {
+			fList->AddChild(new BStringView(NULL, "Nothing heard yet: public "
+				"libraries announced on the network show up here."));
+		}
+		for (int32 i = 0; i < Count(usable); i++) {
+			BMessage l = Item(usable, i);
+			BString name = l.GetString("name", "");
+			if (name.IsEmpty())
+				name = "A public library";
+			BStringView* title = new BStringView(NULL, name.String());
+			title->SetFont(be_bold_font);
+			BString about = l.GetString("about", ""), detail;
+			BMessage has;
+			l.FindMessage("has", &has);
+			if (l.GetBool("readable", true)) {
+				BString node = l.GetString("node", "");
+				node.Truncate(8);
+				detail << Holds(has) << " · from <" << node << "…>, "
+					<< (int32)l.GetDouble("hops", 0) << " hop(s), "
+					<< Ago(l.GetDouble("heard_ms", 0));
+			} else {
+				detail << "Needs a newer retifs (announce v"
+					<< (int32)l.GetDouble("v", 0) << ", format "
+					<< (int32)l.GetDouble("fmt", 0) << ")";
+			}
+			BStringView* aboutView = new BStringView(NULL, about.String());
+			BStringView* detailView = new BStringView(NULL, detail.String());
+			detailView->SetHighUIColor(B_PANEL_TEXT_COLOR, B_LIGHTEN_1_TINT);
+			BView* action;
+			if (l.HasString("here")) {
+				BStringView* label = new BStringView(NULL, "Joined");
+				BString here("Here as ");
+				here << l.GetString("here", "");
+				label->SetToolTip(here.String());
+				label->SetHighUIColor(B_PANEL_TEXT_COLOR, B_LIGHTEN_1_TINT);
+				action = label;
+			} else if (l.GetBool("readable", true)) {
+				BMessage* join = new BMessage(kJoinHeard);
+				join->AddString("address", l.GetString("address", ""));
+				BButton* button = new BButton("Join", join);
+				join->AddPointer("source", button);
+				action = button;
+			} else
+				action = new BStringView(NULL, "");
+			BGroupView* row = new BGroupView(B_HORIZONTAL);
+			BLayoutBuilder::Group<>(row)
+				.AddGroup(B_VERTICAL, 2)
+					.Add(title)
+					.Add(aboutView)
+					.Add(detailView)
+				.End()
+				.AddGlue()
+				.Add(action);
+			fList->AddChild(row);
+			if (i + 1 < Count(usable))
+				fList->AddChild(new BSeparatorView(B_HORIZONTAL));
+		}
+		fList->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+		BString more = fError;
+		int32 other = (int32)heard.GetDouble("other", 0);
+		if (more.IsEmpty() && other > 0) {
+			more << other << " more heard that the map doesn't show (other kinds "
+				"of data; the retifs app lists them).";
+		}
+		fMore->SetText(more);
+	}
+
+	BLooper* fWorker;
+	BGroupView* fList;
+	BStringView* fMore;
+	BString fError;
+	BMessageRunner* fRunner;
+};
+
+
 // #pragma mark - The window
 
 
@@ -1102,7 +1352,7 @@ public:
 		fSearch->TextView()->SetExplicitMinSize(BSize(300, B_SIZE_UNSET));
 		fAdd = new BButton("add", "+", NULL);
 		fAdd->SetToolTip("Add a place");
-		fAnnounces = new BButton("announces", "Announces", NULL);
+		fAnnounces = new BButton("announces", "Announces", new BMessage(kAnnounces));
 		fAnnounces->SetToolTip("Public libraries heard on the network");
 		fStatus = new BStringView("status", "");
 		fStatus->SetHighUIColor(B_PANEL_TEXT_COLOR, B_LIGHTEN_1_TINT);
@@ -1201,6 +1451,12 @@ public:
 			}
 			case kPickMap:
 				_Pick(message->GetString("map", ""), true);
+				break;
+			case kAnnounces:
+				(new AnnouncesWindow(fWorker))->Show();
+				break;
+			case kReload:
+				fWorker->PostMessage(kLoad);
 				break;
 			case kKinds:
 			{
