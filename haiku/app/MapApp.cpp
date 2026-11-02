@@ -495,8 +495,10 @@ public:
 			fprintf(stderr, "%s %d: %d bytes, %s\n",
 				message->what == kThumb ? "thumb" : "preview", (int)i,
 				(int)length, image != NULL ? "decoded" : "not decoded");
-			if (image != NULL && message->what == kThumb) {
-				BBitmap* small = Scaled(image, 80, 80, true);
+			if (image != NULL) {
+				// Kept small: a camera's photo is ~48 MB decoded.
+				BBitmap* small = message->what == kThumb
+					? Scaled(image, 80, 80, true) : Scaled(image, 2560, 2560, false);
 				delete image;
 				image = small;
 			}
@@ -845,7 +847,6 @@ public:
 			return;
 		BRect b = Bounds(), s = fBitmap->Bounds();
 		float scale = std::min(b.Width() / s.Width(), b.Height() / s.Height());
-		scale = std::min(scale, 1.0f);
 		float w = s.Width() * scale, h = s.Height() * scale;
 		BRect r(0, 0, w, h);
 		r.OffsetTo((b.Width() - w) / 2, (b.Height() - h) / 2);
@@ -862,11 +863,17 @@ public:
 	PhotoWindow(const BString& title, BBitmap* shown)
 		:
 		BWindow(BRect(80, 60, 1080, 780), title.String(), B_TITLED_WINDOW,
-			B_AUTO_UPDATE_SIZE_LIMITS)
+			B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE)
 	{
 		fView = new PhotoView(shown);
 		BLayoutBuilder::Group<>(this, B_VERTICAL, 0).Add(fView);
-		CenterOnScreen();
+		// The whole screen, its tab and border just outside.
+		BRect screen = BScreen(this).Frame();
+		BRect frame = Frame(), outer = DecoratorFrame();
+		float left = frame.left - outer.left, top = frame.top - outer.top;
+		float right = outer.right - frame.right, bottom = outer.bottom - frame.bottom;
+		MoveTo(screen.left + left, screen.top + top);
+		ResizeTo(screen.Width() - left - right, screen.Height() - top - bottom);
 	}
 
 	void MessageReceived(BMessage* message)
@@ -892,13 +899,13 @@ private:
 /*! A photo's preview in the bubble; a click opens it larger. */
 class PreviewView : public BView {
 public:
-	PreviewView()
+	PreviewView(float width)
 		:
 		BView("preview", B_WILL_DRAW),
 		fBitmap(NULL)
 	{
 		SetViewColor(B_TRANSPARENT_COLOR);
-		SetExplicitSize(BSize(268, 180));
+		SetExplicitSize(BSize(width, roundf(width * 0.67f)));
 	}
 
 	~PreviewView() { delete fBitmap; }
@@ -948,7 +955,9 @@ public:
 		:
 		BView("bubble", B_WILL_DRAW | B_FRAME_EVENTS),
 		fPlace(p),
-		fPreview(NULL)
+		fPreview(NULL),
+		// As wide at any font size: its text, close button and preview fit.
+		fWidth(roundf(be_plain_font->Size() * 24))
 	{
 		SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
 		BString title(p.title);
@@ -957,6 +966,8 @@ public:
 		BStringView* head = new BStringView(NULL, title.String());
 		head->SetFont(be_bold_font);
 		head->SetTruncation(B_TRUNCATE_END);
+		// A long title shortens ("…"): the close button stays in the bubble.
+		head->SetExplicitMinSize(BSize(60, B_SIZE_UNSET));
 		BButton* close = new BButton("close", "×", new BMessage(kCloseBubble));
 		close->SetTarget(map);
 		close->SetFlat(true);
@@ -974,10 +985,9 @@ public:
 			.Add(_Dim(what))
 			.Add(fBody);
 		if (p.kind == "photo") {
-			fPreview = new PreviewView();
+			fPreview = new PreviewView(fWidth - 16);
 			fBody->AddChild(fPreview);
 		}
-		SetExplicitMaxSize(BSize(300, B_SIZE_UNSET));
 	}
 
 	const Place& Shown() const { return fPlace; }
@@ -1071,12 +1081,11 @@ public:
 		Fit();
 	}
 
-	/*! As big as its contents now. */
+	/*! Its width, and as tall as its contents now (its text shortened). */
 	void Fit()
 	{
 		InvalidateLayout(true);
-		BSize size = GetLayout()->PreferredSize();
-		ResizeTo(std::min(size.width, 300.0f), size.height);
+		ResizeTo(fWidth, GetLayout()->PreferredSize().height);
 		Layout(true);
 	}
 
@@ -1114,6 +1123,7 @@ private:
 		v->SetHighColor(mix_color(ui_color(B_PANEL_TEXT_COLOR),
 			ui_color(B_PANEL_BACKGROUND_COLOR), 150));
 		v->SetTruncation(B_TRUNCATE_END);
+		v->SetExplicitMinSize(BSize(40, B_SIZE_UNSET));
 		return v;
 	}
 
@@ -1127,6 +1137,7 @@ private:
 		BStringView* text = new BStringView(NULL, v.String());
 		text->SetTruncation(B_TRUNCATE_END);
 		text->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+		text->SetExplicitMinSize(BSize(40, B_SIZE_UNSET));
 		BGroupView* row = new BGroupView(B_HORIZONTAL, 6);
 		row->AddChild(l);
 		row->AddChild(text);
@@ -1136,6 +1147,7 @@ private:
 	Place fPlace;
 	BGroupView* fBody;
 	PreviewView* fPreview;
+	float fWidth;
 };
 
 
@@ -1380,6 +1392,8 @@ public:
 			_Clicked(it->members);
 			return;
 		}
+		// A click on the map itself closes the bubble.
+		_CloseBubble();
 	}
 
 	void KeyDown(const char* bytes, int32 count)
@@ -1392,6 +1406,9 @@ public:
 				break;
 			case '-':
 				ZoomBy(-1, middle);
+				break;
+			case B_ESCAPE:
+				_CloseBubble();
 				break;
 			case B_LEFT_ARROW:
 				fCenterX -= 64;
@@ -1473,7 +1490,9 @@ public:
 				message->FindPointer("bitmap", (void**)&bitmap);
 				if (fBubble != NULL && fBubble->Preview() != NULL && bitmap != NULL
 					&& message->GetInt32("i", -1) == fBubble->Shown().index) {
-					fBubble->Preview()->SetBitmap(Scaled(bitmap, 268, 180, false));
+					BRect area = fBubble->Preview()->Bounds();
+					fBubble->Preview()->SetBitmap(Scaled(bitmap,
+						area.IntegerWidth() + 1, area.IntegerHeight() + 1, false));
 					fBubble->Fit();
 					_PlaceBubble();
 				}
