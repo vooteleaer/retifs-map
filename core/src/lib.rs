@@ -629,7 +629,17 @@ impl Map {
             _ => Vec::new(),
         };
         let name = std::iter::once(base.clone()).chain((2..).map(|i| format!("{base}-{i}"))).find(|n| !taken.contains(n)).expect("a free name");
-        self.call(&mut c, Request::NsJoin { ns: name.clone(), address: l.address.clone(), from: vec![l.node.clone()], lazy: true }).map(|_| name)
+        // A map: its index held whole (its tiles' records, small: 12 MB for
+        // Estonia's 95,000 tiles), so a tile is found here at once and one
+        // outside the map is known missing without asking other nodes; its
+        // tiles (big) fetched as they're looked at. Anything else lazily:
+        // only the records asked for (a gazetteer's 380,000 addresses).
+        let map = l.has.iter().any(|(t, _)| t == TILESET_TYPE || t == VECTOR_TILE);
+        self.call(&mut c, Request::NsJoin { ns: name.clone(), address: l.address.clone(), from: vec![l.node.clone()], lazy: !map })?;
+        if map {
+            self.call(&mut c, Request::NsKeep { ns: name.clone(), mode: "rules".into() })?;
+        }
+        Ok(name)
     }
 
     /// Which of `libraries` were joined (made elsewhere), not made here: those

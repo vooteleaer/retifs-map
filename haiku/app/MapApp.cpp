@@ -26,6 +26,7 @@
 #include <Json.h>
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -383,9 +384,16 @@ public:
 		done.AddInt32("y", message->GetInt32("y", 0));
 		if (generation == sGeneration.load()) {
 			size_t length = 0;
+			bigtime_t started = system_time();
 			uint8* data = rm_tile(message->GetString("map", ""),
 				message->GetInt32("z", 0), message->GetInt32("x", 0),
 				message->GetInt32("y", 0), &length);
+			// For whoever wonders why the map is slow: on standard error.
+			fprintf(stderr, "tile %d/%d/%d: %s in %d ms\n",
+				(int)message->GetInt32("z", 0), (int)message->GetInt32("x", 0),
+				(int)message->GetInt32("y", 0),
+				data != NULL ? "drawn" : length == 1 ? "not read" : "none",
+				(int)((system_time() - started) / 1000));
 			if (data == NULL && length == 1) {
 				// Not read now (a fetch timed out): asked again later.
 				done.AddBool("failed", true);
@@ -815,17 +823,19 @@ private:
 
 	bool _DrawAncestor(int z, int x, int y, BRect r)
 	{
-		for (int up = 1; up <= 6 && z - up >= 0; up++) {
+		for (int up = 1; up <= 5 && z - up >= 0; up++) {
 			auto it = fTiles.find(TileKey(z - up, x >> up, y >> up));
 			if (it == fTiles.end())
 				continue;
 			it->second.used = fUse;
-			float part = (float)kTileSize / (1 << up);
-			float sx = (x - ((x >> up) << up)) * part;
-			float sy = (y - ((y >> up) << up)) * part;
-			DrawBitmap(it->second.bitmap,
-				BRect(sx, sy, sx + part - 0.001f, sy + part - 0.001f), r,
-				B_FILTER_BITMAP_BILINEAR);
+			// Whole pixels of the ancestor, and no bilinear filter: app_server
+			// crashed scaling a few pixels up bilinearly (BitmapPainter's
+			// BilinearDefault::DrawToClipRect).
+			int part = kTileSize >> up;
+			int sx = (x - ((x >> up) << up)) * part;
+			int sy = (y - ((y >> up) << up)) * part;
+			DrawBitmap(it->second.bitmap, BRect(sx, sy, sx + part - 1, sy + part - 1),
+				r);
 			return true;
 		}
 		return false;

@@ -13,6 +13,16 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_double, c_int};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tiles_cover_their_area() {
+        let (w, n, e, s) = super::tile_area(8, 145, 75);
+        // Tallinn (24.75, 59.44) is in tile 8/145/75.
+        assert!(w < 24.75 && 24.75 < e && s < 59.44 && 59.44 < n, "{w} {n} {e} {s}");
+    }
+}
+
 use retifs_map_core::vector::{self, Style};
 use retifs_map_core::{Kind, Map, Place, Tileset};
 use serde_json::{Value, json};
@@ -34,6 +44,12 @@ struct State {
 fn map() -> &'static Map {
     static MAP: OnceLock<Map> = OnceLock::new();
     MAP.get_or_init(Map::new)
+}
+
+thread_local! {
+    /// A connection per tile-drawing thread: a Map's calls run one at a
+    /// time, and one slow tile mustn't hold up the others.
+    static TILE_MAP: Map = Map::new();
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -164,7 +180,7 @@ fn raw_tile(t: &Tileset, style: &Style, z: u32, x: u32, y: u32) -> Result<Option
     if let Some(hit) = state().tiles.get(&key) {
         return Ok(hit.clone());
     }
-    let data = map().file(&t.ns, &style.tile_path(z, x, y))?;
+    let data = TILE_MAP.with(|m| m.file(&t.ns, &style.tile_path(z, x, y)))?;
     let mut s = state();
     s.tiles.insert(key.clone(), data.clone());
     s.tile_order.push_back(key);
@@ -194,6 +210,14 @@ pub unsafe extern "C" fn rm_tile(tileset: *const c_char, z: c_int, x: c_int, y: 
         (t, style)
     };
     let (z, x, y) = (z.max(0) as u32, x.max(0) as u32, y.max(0) as u32);
+    // Outside the map's area there are no tiles: not asked for (a missing
+    // tile is looked for on other nodes too, and that takes a while).
+    if let Some([west, south, east, north]) = t.bounds {
+        let (w, n, e, s) = tile_area(z, x, y);
+        if e < west || w > east || s > north || n < south {
+            return std::ptr::null_mut();
+        }
+    }
     let deepest = t.maxzoom.clamp(0, 22) as u32;
     let d = z.saturating_sub(deepest);
     let (tz, tx, ty) = (z - d, x >> d, y >> d);
@@ -209,6 +233,14 @@ pub unsafe extern "C" fn rm_tile(tileset: *const c_char, z: c_int, x: c_int, y: 
     let scale = (1u32 << d) as f32;
     let offset = ((x - (tx << d)) as f32, (y - (ty << d)) as f32);
     bytes(vector::encode(&vector::draw_list(&style, &tile, z as f64, scale, offset)), len)
+}
+
+/// A tile's west, north, east and south edges (degrees).
+fn tile_area(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
+    let n = 2f64.powi(z as i32);
+    let lon = |x: f64| x / n * 360.0 - 180.0;
+    let lat = |y: f64| (std::f64::consts::PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees();
+    (lon(x as f64), lat(y as f64), lon(x as f64 + 1.0), lat(y as f64 + 1.0))
 }
 
 /// A photo's thumbnail (place number `i`), its length in `*len`; NULL if none.
