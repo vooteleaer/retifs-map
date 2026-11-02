@@ -1,0 +1,15 @@
+[package]
+name = "retifs-map-capi"
+description = "retifs Map for Haiku: the shared core to C (the BeAPI front end), JSON and tile draw lists"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "retifs_map"
+crate-type = ["cdylib"]
+
+[dependencies]
+retifs-map-core = { path = "../../core" }
+serde_json = "1"

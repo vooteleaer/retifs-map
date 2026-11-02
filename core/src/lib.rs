@@ -4,6 +4,8 @@
 //! them; it shows them, and lets the user place a contact or an event whose
 //! address or location has no coordinates yet.
 
+pub mod vector;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -664,12 +666,36 @@ impl Map {
 
     /// A map's style, its tiles' URLs pointing at the gateway.
     pub fn style(&self, t: &Tileset) -> Result<String, String> {
+        absolute_style(&self.style_json(t)?, &t.ns)
+    }
+
+    /// A map's style as the library has it (tile paths relative to it):
+    /// what an app drawing the tiles itself reads (`vector`).
+    pub fn style_json(&self, t: &Tileset) -> Result<String, String> {
         let cap = t.style.clone().ok_or("this map has no style")?;
         let size: u64 = cap.rsplit(':').next().and_then(|s| s.parse().ok()).ok_or("a bad read-cap")?;
         let mut c = self.client()?;
         match self.call(&mut c, Request::ReadRange { cap, ns: Some(t.ns.clone()), offset: 0, len: size, wait_ms: 30_000 })? {
-            Response::Range { data } => absolute_style(&String::from_utf8_lossy(&data), &t.ns),
+            Response::Range { data } => Ok(String::from_utf8_lossy(&data).into_owned()),
             _ => Err("no style".into()),
+        }
+    }
+
+    /// A file of a library by its path (a map's tile), fetched if it isn't
+    /// here: Ok(None) if there's none (a tile outside the map), an error if
+    /// it couldn't be read now (worth asking again later).
+    pub fn file(&self, ns: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let mut c = self.client()?;
+        let records = match self.call(&mut c, Request::Query { ns: ns.into(), terms: vec![format!("path={path}")], at: None })? {
+            Response::Records { records } => records,
+            _ => return Err("unexpected answer".into()),
+        };
+        let Some(r) = records.into_iter().next() else { return Ok(None) };
+        let Some(cap) = r.blocks.first().cloned() else { return Ok(Some(Vec::new())) };
+        let size: u64 = cap.rsplit(':').next().and_then(|s| s.parse().ok()).ok_or("a bad read-cap")?;
+        match self.call(&mut c, Request::ReadRange { cap, ns: Some(ns.to_string()), offset: 0, len: size, wait_ms: 30_000 })? {
+            Response::Range { data } => Ok(Some(data)),
+            _ => Err("unexpected answer".into()),
         }
     }
 

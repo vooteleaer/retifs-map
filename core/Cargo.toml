@@ -12,3 +12,5 @@ tokio = { version = "1", features = ["rt"] }
 serde_json = "1"
 # Address search folds text as the importer does (NFKD, no marks).
 unicode-normalization = "0.1"
+# Vector tiles, gzipped as some tile makers write them (the Haiku app draws them).
+flate2 = "1"
