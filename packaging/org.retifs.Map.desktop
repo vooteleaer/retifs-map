@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Map
+GenericName=Map
+Comment=Places, photos, contacts and events from your libraries, on maps kept in retifs
+Exec=retifs-map
+Icon=org.retifs.Map
+Terminal=false
+Categories=Utility;Maps;
+Keywords=map;places;location;retifs;
+StartupNotify=true
