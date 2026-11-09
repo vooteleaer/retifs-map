@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "gtk", "import", "android/jni", "haiku/capi"]
-# The GTK front end builds only where GTK 4 and libadwaita are installed (Linux).
+members = ["core", "gtk", "windows", "import", "android/jni", "haiku/capi"]
+# The GTK front end builds only where GTK 4 and libadwaita are installed (Linux),
+# the Windows one only on Windows.
 default-members = ["core", "import"]
 
 [workspace.package]

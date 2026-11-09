@@ -442,6 +442,12 @@ impl Map {
     /// no internet service. Words are matched by their beginnings ("raek
     /// tall"); a word starting with a digit is a house number.
     pub fn find(&self, text: &str, here: &[Place]) -> Result<Vec<Found>, String> {
+        let libraries = self.libraries()?;
+        self.find_in(text, here, &libraries)
+    }
+
+    /// As `find`, in these libraries only (those a map shows).
+    pub fn find_in(&self, text: &str, here: &[Place], libraries: &[String]) -> Result<Vec<Found>, String> {
         let words = fold(text);
         let (numbers, words): (Vec<String>, Vec<String>) = words.into_iter().partition(|w| w.starts_with(|c: char| c.is_ascii_digit()));
         let number = numbers.concat();
@@ -453,7 +459,7 @@ impl Map {
         let terms: Vec<String> = words.iter().take(MAX_FIND_WORDS).map(|w| format!("find=\"{w}\"")).collect();
         let mut c = self.client()?;
         let mut hits: Vec<(i64, Found)> = find_here(here, text);
-        for ns in self.libraries()? {
+        for ns in libraries.iter().cloned() {
             if !self.searchable(&mut c, &ns, "find") {
                 continue;
             }
