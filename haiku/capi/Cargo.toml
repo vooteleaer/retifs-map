@@ -8,7 +8,8 @@ publish.workspace = true
 
 [lib]
 name = "retifs_map"
-crate-type = ["cdylib"]
+# rlib too: the Android app calls the same functions (android/jni).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 retifs-map-core = { path = "../../core" }

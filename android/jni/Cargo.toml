@@ -1,0 +1,17 @@
+[package]
+name = "retifs-map-jni"
+description = "retifs Map for Android: the map's C API (haiku/capi) to Kotlin, through JNI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "retifs_map_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The same calls as the Haiku app: libraries, places, tiles as draw lists, icons, search.
+retifs-map-capi = { path = "../../haiku/capi" }
+retifs-map-core = { path = "../../core" }
+jni = { version = "0.21", default-features = false }

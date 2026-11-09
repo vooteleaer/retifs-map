@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The map icon (packaging/org.retifs.Map.svg) in the adaptive icon's safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:translateX="22" android:translateY="22" android:scaleX="0.5" android:scaleY="0.5">
+        <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd" android:pathData="M64,26c-15,0 -26,11 -26,25 0,19 26,51 26,51s26,-32 26,-51c0,-14 -11,-25 -26,-25zM64,61a10,10 0,1 1,0 -20a10,10 0,0 1,0 20z"/>
+    </group>
+</vector>

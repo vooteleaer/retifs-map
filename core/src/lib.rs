@@ -368,6 +368,20 @@ fn address_hits(r: &RecordView, words: &[String], number: Option<&str>) -> Vec<(
 }
 
 
+/// Opens a connection to `retifsd` some other way than its socket (on
+/// Android: from the retifs app's access service), for every Map.
+#[cfg(unix)]
+pub type Connector = Box<dyn Fn() -> Result<std::os::unix::net::UnixStream, String> + Send + Sync>;
+
+#[cfg(unix)]
+static CONNECTOR: std::sync::OnceLock<Connector> = std::sync::OnceLock::new();
+
+/// Every Map's connections from `connector` from now on (set once).
+#[cfg(unix)]
+pub fn set_connector(connector: Connector) {
+    let _ = CONNECTOR.set(connector);
+}
+
 /// The connection to `retifsd`.
 pub struct Map {
     rt: tokio::runtime::Runtime,
@@ -461,6 +475,11 @@ impl Map {
     }
 
     fn client(&self) -> Result<Client, String> {
+        #[cfg(unix)]
+        if let Some(connect) = CONNECTOR.get() {
+            let stream = connect()?;
+            return self.rt.block_on(async { Client::from_std(stream) }).map(|c| c.via(self.via.clone())).map_err(|e| e.to_string());
+        }
         self.rt.block_on(Client::connect(&self.store)).map(|c| c.via(self.via.clone())).map_err(|e| e.to_string())
     }
 
