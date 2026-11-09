@@ -1,0 +1,83 @@
+# org.retifs.Map: the GTK app only. It uses whichever retifsd runs on this computer
+# (the retifs .deb's), through the shared store's socket. Build it with
+# build.sh next to this: it stages the sources this names (src/…) beside a
+# copy of this file.
+id: org.retifs.Map
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: retifs-map
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # The one store every retifs Flatpak and the host's retifsd share (its
+  # socket is there).
+  - --filesystem=xdg-data/retifs:create
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  # cargo fetches the crates (local bundles; no vendoring).
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/retifs-map/cargo
+modules:
+  # libshumate is not in the GNOME runtime; its vector renderer (the maps
+  # retifs keeps are vector tiles) needs protobuf-c.
+  - name: protobuf-c
+    buildsystem: autotools
+    config-opts:
+      - --disable-protoc
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - "*.la"
+      - "*.a"
+    sources:
+      - type: archive
+        url: https://github.com/protobuf-c/protobuf-c/releases/download/v1.5.2/protobuf-c-1.5.2.tar.gz
+        sha256: e2c86271873a79c92b58fef7ebf8de1aa0df4738347a8bd5d4e65a80a16d0d24
+  - name: libshumate
+    buildsystem: meson
+    config-opts:
+      - -Dgir=false
+      - -Dvapi=false
+      - -Dgtk_doc=false
+      - -Ddemos=false
+      - -Dvector_renderer=true
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/libshumate/1.6/libshumate-1.6.3.tar.xz
+        sha256: fd15c91396dcd82fce3021648541aa891e71a6bddeffc03d38597580a7da8ca1
+  - name: retifs-map
+    buildsystem: simple
+    sources:
+      - type: dir
+        path: src/retifs
+        dest: retifs
+      - type: dir
+        path: src/retifs-map
+        dest: retifs-map
+      # The store set (inside a Flatpak XDG_DATA_HOME is the app's own),
+      # then the program.
+      - type: script
+        dest-filename: wrapper
+        commands:
+          - ': "${RETIFS_STORE:=$HOME/.local/share/retifs}"'
+          - export RETIFS_STORE
+          - exec /app/libexec/retifs-map "$@"
+    build-commands:
+      - cargo build --release --locked --manifest-path retifs-map/Cargo.toml -p retifs-map-gtk
+      - install -Dm755 retifs-map/target/release/retifs-map /app/libexec/retifs-map
+      - install -Dm755 wrapper /app/bin/retifs-map
+      - install -Dm644 retifs-map/packaging/org.retifs.Map.desktop -t /app/share/applications
+      - install -Dm644 retifs-map/packaging/org.retifs.Map.svg -t /app/share/icons/hicolor/scalable/apps
+      - install -Dm644 retifs-map/packaging/flatpak/org.retifs.Map.metainfo.xml -t /app/share/metainfo
+      - install -Dm644 retifs-map/LICENSE -t /app/share/licenses/org.retifs.Map

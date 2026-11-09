@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.retifs.Map</id>
+  <name>Map</name>
+  <summary>Places, photos, contacts and events from your libraries, on maps kept in retifs</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Places, photos, contacts and events from your retifs libraries, on maps that are themselves kept in retifs (no map service on the internet). It uses the retifs daemon of this computer (the retifs .deb),
+    whose store all retifs apps share. A prototype.</p>
+  </description>
+  <launchable type="desktop-id">org.retifs.Map.desktop</launchable>
+  <url type="homepage">https://github.com/vooteleaer/retifs</url>
+  <content_rating type="oars-1.1"/>
+</component>
