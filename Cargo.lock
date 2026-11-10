@@ -615,7 +615,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libretifs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "rmp-serde",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-capi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "resvg",
  "retifs-map-core",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libretifs",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-gtk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-import"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libretifs",
  "serde_json",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-jni"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jni",
  "retifs-map-capi",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "retifs-map-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libretifs",
  "resvg",
