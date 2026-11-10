@@ -47,6 +47,8 @@ const TILE_CACHE: usize = 64;
 #[derive(Default)]
 struct State {
     libraries: Vec<String>,
+    /// Their change counts as the load began: where `rm_wait_change` starts.
+    counts: HashMap<String, u64>,
     tilesets: Vec<Tileset>,
     styles: HashMap<String, Style>,
     places: Vec<Place>,
@@ -131,6 +133,8 @@ pub extern "C" fn rm_load() -> *mut c_char {
         Ok(l) => l,
         Err(e) => return out(json!({ "error": e })),
     };
+    // Counted before reading: a change while reading is a change to wait for.
+    let counts = m.change_counts(&libraries);
     let lazy = m.lazy(&libraries);
     let address = m.address_libraries(&libraries);
     let lazy_places = m.place_libraries(&lazy);
@@ -153,6 +157,7 @@ pub extern "C" fn rm_load() -> *mut c_char {
     });
     let mut s = state();
     s.libraries = libraries;
+    s.counts = counts;
     s.tilesets = tilesets;
     s.places = places;
     out(v)
@@ -168,9 +173,11 @@ pub extern "C" fn rm_libraries() -> *mut c_char {
         Ok(l) => l,
         Err(e) => return out(json!({ "error": e })),
     };
+    let counts = m.change_counts(&libraries);
     let lazy = m.lazy(&libraries);
     let mut s = state();
     s.libraries = libraries.clone();
+    s.counts = counts;
     s.tilesets.clear();
     s.places.clear();
     out(json!({ "libraries": libraries, "lazy": lazy }))
@@ -466,6 +473,30 @@ pub unsafe extern "C" fn rm_keep(ns: *const c_char, all: c_int) -> *mut c_char {
 pub extern "C" fn rm_change_counts() -> *mut c_char {
     let libraries = state().libraries.clone();
     out(json!(map().change_counts(&libraries)))
+}
+
+/// Waits until a library loaded changes, for at most `timeout_ms`:
+/// `{"changed", "known"}`, "known" (`{ns: count}`) what to pass next time
+/// (`{}` the first). retifsd says the moment one does, so the app reloads
+/// at once; called on a thread of its own, it has a Map of its own.
+///
+/// # Safety
+/// `known` is null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rm_wait_change(known: *const c_char, timeout_ms: c_int) -> *mut c_char {
+    let mut known: HashMap<String, u64> = serde_json::from_str(&unsafe { arg(known) }).unwrap_or_default();
+    {
+        // The libraries loaded now, a newly loaded one from the count of its load.
+        let s = state();
+        known.retain(|ns, _| s.libraries.contains(ns));
+        for ns in &s.libraries {
+            if let Some(n) = s.counts.get(ns) {
+                known.entry(ns.clone()).or_insert(*n);
+            }
+        }
+    }
+    let changed = map().wait_change(&mut known, std::time::Duration::from_millis(timeout_ms.max(0) as u64));
+    out(json!({ "changed": changed, "known": known }))
 }
 
 /// # Safety

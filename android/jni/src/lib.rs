@@ -192,3 +192,13 @@ pub extern "system" fn Java_org_retifs_map_Core_changeCounts<'l>(mut env: JNIEnv
     let r = capi::rm_change_counts();
     out(&mut env, r)
 }
+
+/// Waits until a library read changes, at most `timeout_ms`: `{"changed",
+/// "known"}`, "known" what to pass next time (`{}` the first). Blocks: on
+/// a thread of its own, which has a Map of its own.
+#[no_mangle]
+pub extern "system" fn Java_org_retifs_map_Core_waitChange<'l>(mut env: JNIEnv<'l>, _: JClass<'l>, known: JString<'l>, timeout_ms: jint) -> jstring {
+    let k = arg(&mut env, &known);
+    let r = unsafe { capi::rm_wait_change(k.as_ptr(), timeout_ms) };
+    out(&mut env, r)
+}

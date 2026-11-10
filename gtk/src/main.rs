@@ -367,31 +367,44 @@ fn build(gapp: &adw::Application) {
     layers_ui(&me);
     *me.base.borrow_mut() = None;
     reload(&me);
-    {
-        let me2 = me.clone();
-        glib::timeout_add_seconds_local(3, move || {
-            let libs = me2.libraries.borrow().clone();
-            let me3 = me2.clone();
-            bg(&me2.core, move |m| m.change_counts(&libs), move |counts| {
-                if counts.is_empty() || counts == *me3.counts.borrow() {
-                    return;
-                }
-                let changed: HashSet<String> = counts.iter().filter(|(ns, n)| me3.counts.borrow().get(*ns) != Some(*n)).map(|(ns, _)| ns.clone()).collect();
-                refresh_base(&me3, &changed);
-                // A map library changing (tiles) has no places to reload.
-                let maps: HashSet<String> = me3.tilesets.borrow().iter().map(|t| t.ns.clone()).collect();
-                if changed.is_subset(&maps) {
-                    *me3.counts.borrow_mut() = counts;
-                } else {
-                    reload(&me3);
-                }
-            });
-            glib::ControlFlow::Continue
-        });
-    }
+    watch_changes(&me, Arc::new(Map::new()), HashMap::new());
     snapshot_on_request(&window);
     demo_search(&me);
     window.present();
+}
+
+/// Reloads when a library shown changes: retifsd says so the moment it
+/// does (`Map::wait_change`), waited for on a `Map` of its own so nothing
+/// else is held up meanwhile.
+fn watch_changes(me: &Rc<App>, watcher: Arc<Map>, mut known: HashMap<String, u64>) {
+    // The libraries shown now, a newly shown one from the count of the last load.
+    let libs = me.libraries.borrow().clone();
+    known.retain(|ns, _| libs.contains(ns));
+    for (ns, n) in me.counts.borrow().iter() {
+        if libs.contains(ns) {
+            known.entry(ns.clone()).or_insert(*n);
+        }
+    }
+    let (me2, w) = (me.clone(), watcher.clone());
+    bg(&watcher, move |m| {
+        let changed = m.wait_change(&mut known, std::time::Duration::from_secs(60));
+        (changed, known)
+    }, move |(changed, known)| {
+        if changed {
+            let changed: HashSet<String> = known.iter().filter(|(ns, n)| me2.counts.borrow().get(*ns) != Some(*n)).map(|(ns, _)| ns.clone()).collect();
+            if !changed.is_empty() {
+                refresh_base(&me2, &changed);
+                // A map library changing (tiles) has no places to reload.
+                let maps: HashSet<String> = me2.tilesets.borrow().iter().map(|t| t.ns.clone()).collect();
+                if changed.is_subset(&maps) {
+                    me2.counts.borrow_mut().extend(known.clone());
+                } else {
+                    reload(&me2);
+                }
+            }
+        }
+        watch_changes(&me2, w, known);
+    });
 }
 
 fn reload(me: &Rc<App>) {

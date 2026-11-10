@@ -62,8 +62,7 @@ enum {
 	kLibraries = 'libs',	// window: a library shown or hidden
 	kZoomIn = 'zmin',
 	kZoomOut = 'zmou',
-	kChanges = 'chng',
-	kChanged = 'chgd',
+	kChanged = 'chgd',		// window: a library loaded changed
 	kAnnounces = 'annc',	// window: open the announces
 	kHeard = 'herd',		// worker: the libraries heard ("reply": where to)
 	kHeardDone = 'hrdd',
@@ -571,6 +570,46 @@ private:
 };
 
 
+/*! The known counts ({ns: count}) as JSON again, for rm_wait_change. */
+static BString
+KnownJson(const BMessage& known)
+{
+	BString json("{");
+	char* name;
+	type_code type;
+	for (int32 i = 0; known.GetInfo(B_DOUBLE_TYPE, i, &name, &type) == B_OK; i++) {
+		BString ns(name);
+		ns.CharacterEscape("\\\"", '\\');
+		if (i > 0)
+			json << ",";
+		json << "\"" << ns << "\":" << (int64)known.GetDouble(name, 0);
+	}
+	return json << "}";
+}
+
+
+/*! Waits for a library loaded to change on a thread of its own (retifsd
+	says the moment one does) and tells the window; ends when the window
+	is gone. `data` is a BMessenger to it, the thread's to delete. */
+static status_t
+WatchChanges(void* data)
+{
+	BMessenger* target = (BMessenger*)data;
+	BString known("{}");
+	while (target->IsValid()) {
+		BMessage answer = Take(rm_wait_change(known.String(), 60000));
+		BMessage counts;
+		answer.FindMessage("known", &counts);
+		known = KnownJson(counts);
+		if (answer.GetBool("changed", false)
+			&& target->SendMessage(kChanged) != B_OK)
+			break;
+	}
+	delete target;
+	return B_OK;
+}
+
+
 /*! Everything else the core is asked, one at a time. */
 class Worker : public BLooper {
 public:
@@ -677,13 +716,6 @@ public:
 					message->GetString("ns", ""),
 					message->GetBool("all", false) ? 1 : 0))));
 				fTarget.SendMessage(&kept);
-				break;
-			}
-			case kChanges:
-			{
-				BMessage changed(kChanged);
-				changed.AddMessage("counts", new BMessage(Take(rm_change_counts())));
-				fTarget.SendMessage(&changed);
 				break;
 			}
 			default:
@@ -2360,13 +2392,14 @@ public:
 		fQuick = new Worker(BMessenger(this));
 		fQuick->Run();
 		fWorker->PostMessage(kLoad);
-		BMessage changes(kChanges);
-		fRunner = new BMessageRunner(BMessenger(fWorker), &changes, 5000000);
+		thread_id watcher = spawn_thread(WatchChanges, "map changes",
+			B_NORMAL_PRIORITY, new BMessenger(this));
+		if (watcher >= 0)
+			resume_thread(watcher);
 	}
 
 	~MapWindow()
 	{
-		delete fRunner;
 		fWorker->Lock();
 		fWorker->Quit();
 		fQuick->Lock();
@@ -2589,17 +2622,8 @@ public:
 				break;
 			}
 			case kChanged:
-			{
-				BMessage counts;
-				message->FindMessage("counts", &counts);
-				if (fCounts.IsEmpty())
-					fCounts = counts;
-				else if (!_Same(fCounts, counts)) {
-					fCounts = counts;
-					fWorker->PostMessage(kLoad);
-				}
+				fWorker->PostMessage(kLoad);
 				break;
-			}
 			default:
 				BWindow::MessageReceived(message);
 		}
@@ -2671,17 +2695,6 @@ private:
 		BStringView* v = new BStringView(NULL, text);
 		v->SetFont(be_bold_font);
 		return v;
-	}
-
-	static bool _Same(const BMessage& a, const BMessage& b)
-	{
-		char* name;
-		type_code type;
-		for (int32 i = 0; a.GetInfo(B_ANY_TYPE, i, &name, &type) == B_OK; i++) {
-			if (a.GetDouble(name, -1) != b.GetDouble(name, -1))
-				return false;
-		}
-		return a.CountNames(B_ANY_TYPE) == b.CountNames(B_ANY_TYPE);
 	}
 
 	/*! One library read: its maps and places join those shown, at once
@@ -2911,12 +2924,10 @@ private:
 	bool fZoomed = false;
 	BRect fRestore;
 	BMessage fTilesets;
-	BMessage fCounts;
 	BString fShownMap;
 	bool fFitted;
 	Worker* fWorker;
 	Worker* fQuick;
-	BMessageRunner* fRunner;
 };
 
 

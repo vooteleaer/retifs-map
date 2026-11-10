@@ -54,6 +54,10 @@ char* rm_leave(const char* ns);
 /* Keeps all of a library here (all 1: readable offline) or what's used (0). */
 char* rm_keep(const char* ns, int all);
 char* rm_change_counts(void);
+/* Waits until a library loaded changes, at most timeout_ms: {"changed",
+ * "known"}; "known" ({ns: count}) is passed next time ("{}" the first).
+ * On a thread of its own: it blocks until then. */
+char* rm_wait_change(const char* known, int timeout_ms);
 
 void rm_free(char* s);
 void rm_free_bytes(uint8_t* bytes, size_t len);

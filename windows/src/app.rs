@@ -198,7 +198,7 @@ pub fn run() {
         crate::tiles::start();
         work::start();
         work::ask(Job::Load);
-        work::ask(Job::Poll(Vec::new()));
+        work::ask(Job::Poll);
         SetTimer(hwnd, T_POLL, 5000, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let mut msg = MSG::default();
@@ -799,7 +799,7 @@ unsafe fn event(u: &mut Ui, e: Event) {
             }
             update_join(u);
             work::ask(Job::Load);
-            work::ask(Job::Poll(u.order.clone()));
+            work::ask(Job::Poll);
         }
         Event::Changed => work::ask(Job::Load),
         Event::Cells { ns, found } => {
@@ -920,13 +920,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = KillTimer(hwnd, T_SEARCH);
                     ui(|u| search_now(u, false));
                 }
-                // Announces keep coming, libraries change; retifs may have started.
+                // Announces keep coming; retifs may have started.
                 T_POLL => {
                     ui(|u| {
                         if u.load_failed.is_some() {
                             work::ask(Job::Load);
                         } else if !u.loading {
-                            work::ask(Job::Poll(u.order.clone()));
+                            work::ask(Job::Poll);
                         }
                     });
                 }

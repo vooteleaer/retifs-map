@@ -839,6 +839,36 @@ impl Map {
             })
             .collect()
     }
+
+    /// Waits until one of the libraries in `known` (with their change counts)
+    /// changes, for at most `timeout`: whether one did, its count in `known`
+    /// brought up to date. retifsd answers the moment a change comes, so a
+    /// front end waiting on this (on a thread, with a `Map` of its own)
+    /// shows new places at once instead of asking every few seconds.
+    pub fn wait_change(&self, known: &mut HashMap<String, u64>, timeout: std::time::Duration) -> bool {
+        let watches: Vec<_> = known.iter().filter_map(|(ns, n)| self.client().ok().map(|c| (c, ns.clone(), *n))).collect();
+        if watches.is_empty() {
+            std::thread::sleep(timeout.min(std::time::Duration::from_secs(5)));
+            return false;
+        }
+        match self.rt.block_on(libretifs::watch_any(watches, timeout)) {
+            Ok(Some((ns, count))) => {
+                known.insert(ns, count);
+                // Changes come in bursts (a sync merging many): a second
+                // more, then every count as it is, so one reload takes them all.
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let libraries: Vec<String> = known.keys().cloned().collect();
+                known.extend(self.change_counts(&libraries));
+                true
+            }
+            Ok(None) => false,
+            // retifsd away (restarting): not at once again.
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]

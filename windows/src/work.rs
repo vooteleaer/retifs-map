@@ -4,9 +4,10 @@
 //! window is told once to look; it takes all that's queued.
 //!
 //! Two job threads as in the Haiku app: a slow one (reading libraries,
-//! polling) and a quick one (styles, places by area, thumbnails), so a slow
+//! Announces) and a quick one (styles, places by area, thumbnails), so a slow
 //! library doesn't hold up the map. Searching has a thread of its own that
-//! only ever runs the latest search typed.
+//! only ever runs the latest search typed, and one waits for the libraries
+//! read to change.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -62,8 +63,8 @@ pub enum Event {
 
 pub enum Job {
     Load,
-    /// Announces, and whether these libraries changed (every few seconds).
-    Poll(Vec<String>),
+    /// Announces (every few seconds).
+    Poll,
     Join(HeardLibrary),
     Cells(String, Vec<String>),
     Style(Tileset),
@@ -100,6 +101,10 @@ struct Workers {
 
 static WORKERS: OnceLock<Workers> = OnceLock::new();
 
+/// The libraries the last load read, with their change counts then: what
+/// the watcher waits on.
+static READ: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
 /// Starts the job and search threads (once).
 pub fn start() {
     let (slow, slow_rx) = channel();
@@ -110,12 +115,13 @@ pub fn start() {
     std::thread::spawn(move || jobs(slow_rx));
     std::thread::spawn(move || jobs(quick_rx));
     std::thread::spawn(searcher);
+    std::thread::spawn(watcher);
 }
 
 pub fn ask(job: Job) {
     let Some(w) = WORKERS.get() else { return };
     let to = match job {
-        Job::Load | Job::Poll(_) | Job::Join(_) => &w.slow,
+        Job::Load | Job::Poll | Job::Join(_) => &w.slow,
         _ => &w.quick,
     };
     let _ = to.lock().unwrap().send(job);
@@ -127,23 +133,10 @@ fn jobs(rx: Receiver<Job>) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let m = Map::new();
-    let mut counts: Option<HashMap<String, u64>> = None;
     while let Ok(job) = rx.recv() {
         match job {
-            Job::Load => {
-                load(&m);
-                counts = None;
-            }
-            Job::Poll(libraries) => {
-                send(Event::Heard(m.heard()));
-                // Changed since last asked: read again (the first time only
-                // notes them; libraries come and go with a load of their own).
-                let now = m.change_counts(&libraries);
-                if counts.as_ref().is_some_and(|c| c.len() == now.len() && c.keys().all(|k| now.contains_key(k)) && *c != now) {
-                    send(Event::Changed);
-                }
-                counts = Some(now);
-            }
+            Job::Load => load(&m),
+            Job::Poll => send(Event::Heard(m.heard())),
             Job::Join(l) => send(Event::Joined(m.join_heard(&l))),
             Job::Cells(ns, cells) => {
                 let found = m.places_in(&ns, &cells).unwrap_or_default();
@@ -176,6 +169,9 @@ fn load(m: &Map) {
         }
     };
     send(Event::Libraries(Ok(libraries.clone())));
+    // Counted before reading: a change while reading is a change to wait for.
+    let counts = m.change_counts(&libraries);
+    *READ.lock().unwrap() = counts.into_iter().collect();
     let lazy = m.lazy(&libraries);
     for ns in &libraries {
         let one = [ns.clone()];
@@ -187,6 +183,25 @@ fn load(m: &Map) {
         send(Event::Library(Library { ns: ns.clone(), tilesets, places, by_cell, address }));
     }
     send(Event::LoadDone);
+}
+
+/// Reads again when a library read changes: retifsd says so the moment it
+/// does (`Map::wait_change`), waited for on a `Map` of its own so no job
+/// is held up meanwhile.
+fn watcher() {
+    let m = Map::new();
+    let mut known: HashMap<String, u64> = HashMap::new();
+    loop {
+        // The libraries read now, a newly read one from the count of its load.
+        let read = READ.lock().unwrap().clone();
+        known.retain(|ns, _| read.iter().any(|(n, _)| n == ns));
+        for (ns, n) in read {
+            known.entry(ns).or_insert(n);
+        }
+        if m.wait_change(&mut known, std::time::Duration::from_secs(60)) {
+            send(Event::Changed);
+        }
+    }
 }
 
 /// A search to run: only the latest is, the ones typed over are dropped.

@@ -96,6 +96,8 @@ import org.json.JSONObject
 class MainActivity : ComponentActivity() {
     /** A place handed over (`geo:` link): shown, pinned. */
     private var handed by mutableStateOf<Triple<Double, Double, Double>?>(null)
+    /** On screen: only then are changes waited for. */
+    private var shown by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -109,9 +111,19 @@ class MainActivity : ComponentActivity() {
                 else -> lightColorScheme()
             }
             MaterialTheme(colorScheme = colors) {
-                Surface(Modifier.fillMaxSize()) { App(handed) }
+                Surface(Modifier.fillMaxSize()) { App(handed, shown) }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        shown = true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        shown = false
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -155,7 +167,6 @@ class Atlas(val context: Context) {
     var error by mutableStateOf("")
     /** Map ID → background (0xAARRGGBB), once its style is read. */
     val styles = HashMap<String, Int>()
-    private var counts = ""
 
     fun prefs() = context.getSharedPreferences("map", Context.MODE_PRIVATE)
 
@@ -200,11 +211,8 @@ class Atlas(val context: Context) {
             places = all.toList()
             libs.add(Lib(ns, maps, ps.size, l.optBoolean("by_cell"), l.optBoolean("address"), l.optBoolean("writable"), l.optInt("records"), l.optInt("peers"), l.optBoolean("lazy")))
         }
-        counts = core { Core.changeCounts() }
         reading = null
     }
-
-    suspend fun changed(): Boolean = counts.isNotEmpty() && core { Core.changeCounts() } != counts
 
     /** Places of lazily held libraries around a view (from zoom 12). */
     suspend fun around(bounds: DoubleArray, zoom: Int) {
@@ -226,7 +234,7 @@ class Atlas(val context: Context) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun App(handed: Triple<Double, Double, Double>?) {
+fun App(handed: Triple<Double, Double, Double>?, shown: Boolean) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val atlas = remember { Atlas(context) }
@@ -257,10 +265,16 @@ fun App(handed: Triple<Double, Double, Double>?) {
             pin = lat to lon
         }
     }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(20_000)
-            if (atlas.reading == null && Retifs.problem == null && atlas.changed()) atlas.load()
+    // Read again the moment a library read changes (retifsd says so), while on screen.
+    LaunchedEffect(shown) {
+        var known = "{}"
+        while (shown) {
+            val answer = JSONObject(core { Core.waitChange(known, 60_000) })
+            known = answer.optJSONObject("known")?.toString() ?: "{}"
+            if (!answer.optBoolean("changed") || Retifs.problem != null) continue
+            // Reading already: once that's done (it may have begun before the change).
+            while (atlas.reading != null) delay(500)
+            atlas.load()
         }
     }
     Location(follow, onFix = { fix ->

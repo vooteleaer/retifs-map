@@ -40,6 +40,8 @@ object Core {
     /** `{"usable": [{"name", "about", "address", "here", "hops", "has", …}], "other"}` */
     external fun heard(): String
     external fun changeCounts(): String
+    /** Waits until a library read changes, at most `timeoutMs`: `{"changed", "known"}`; "known" is passed next time (`{}` the first). */
+    external fun waitChange(knownJson: String, timeoutMs: Int): String
 }
 
 suspend fun <T> core(work: () -> T): T = withContext(Dispatchers.IO) { work() }
