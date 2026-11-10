@@ -4,6 +4,19 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// The version (retifs docs/versioning.md): the workspace's, a release's when
+// this commit is tagged with it, else a build towards it; the commit count is
+// the versionCode, so each build installs over the one before.
+val repo = rootProject.projectDir.parentFile
+fun git(vararg args: String): String = try {
+    ProcessBuilder(listOf("git", "-C", repo.path) + args).redirectErrorStream(true).start().inputStream.bufferedReader().readText().trim()
+} catch (e: Exception) {
+    ""
+}
+val workspaceVersion = File(repo, "Cargo.toml").readLines().first { it.startsWith("version = ") }.substringAfter('"').substringBefore('"')
+val commits = git("rev-list", "--count", "HEAD").toIntOrNull() ?: 1
+val released = git("describe", "--exact-match", "--tags", "HEAD") == "v$workspaceVersion"
+
 android {
     namespace = "org.retifs.map"
     compileSdk = 34
@@ -12,8 +25,8 @@ android {
         applicationId = "org.retifs.map"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.0.1"
+        versionCode = commits
+        versionName = if (released) workspaceVersion else "$workspaceVersion-dev.$commits"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 

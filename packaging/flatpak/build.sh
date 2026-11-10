@@ -6,7 +6,7 @@
 # Flathub. retifs is expected next to this repo (`../retifs`), as for the
 # .deb. retifs itself (retifsd) is the host's: the retifs .deb.
 #
-#     packaging/flatpak/build.sh [OUT_DIR] [SUFFIX]
+#     packaging/flatpak/build.sh [OUT_DIR] [NAME]
 #
 # Install: flatpak install --user <bundle> (the runtime comes from Flathub).
 set -euo pipefail
@@ -20,8 +20,15 @@ SRCS="retifs $(basename "$ROOT")"
 OUT=${1:-$ROOT/target/flatpak}
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1 | tr -d '\r')
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-DATE=$(git -C "$ROOT" log -1 --format=%cd --date=format:%Y%m%d 2>/dev/null || date +%Y%m%d)
-SUFFIX=${2:-git$DATE.$COMMIT}
+# The bundle named as a release when this commit is tagged with the version,
+# else as a build towards it (retifs docs/versioning.md).
+COUNT=$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 0)
+if [ "$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null)" = "v$VERSION" ]; then
+    NAME=$VERSION
+else
+    NAME=$VERSION-dev.$COUNT
+fi
+NAME=${2:-$NAME}
 ARCH=${ARCH:-$(flatpak --default-arch)}
 # Off the Windows mount, if that's where the repos are (WSL): much faster.
 WORK=${WORK:-$HOME/.cache/retifs-flatpak/$ID}
@@ -46,7 +53,7 @@ flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/fl
 # No FUSE needed (rofiles-fuse): WSL and containers often have none.
 flatpak-builder --user --arch="$ARCH" --force-clean --disable-rofiles-fuse --install-deps-from=flathub \
     --state-dir="$WORK/state" --repo="$WORK/repo" "$WORK/build" "$WORK/$ID.yml"
-BUNDLE="$OUT/$ID-$VERSION-$SUFFIX.flatpak"
+BUNDLE="$OUT/$ID-$NAME.flatpak"
 # The runtime from Flathub when the bundle is installed.
 flatpak build-bundle --arch="$ARCH" --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo "$WORK/repo" "$BUNDLE" "$ID"
 echo "== $BUNDLE ($(du -h "$BUNDLE" | cut -f1))"
