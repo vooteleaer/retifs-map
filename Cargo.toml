@@ -6,7 +6,7 @@ members = ["core", "gtk", "windows", "import", "android/jni", "haiku/capi"]
 default-members = ["core", "import"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 publish = false
