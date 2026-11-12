@@ -15,4 +15,4 @@ retifs-map-core = { path = "../core" }
 libretifs = { path = "../../retifs/crates/libretifs" }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_5"] }
-shumate = { package = "libshumate", version = "0.7" }
+shumate = { package = "libshumate", version = "0.7", features = ["v1_2"] }

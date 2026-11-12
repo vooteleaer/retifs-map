@@ -7,6 +7,7 @@
 //! updates as the libraries change.
 
 mod announces;
+mod blank;
 mod bubble;
 mod icons;
 
@@ -132,7 +133,7 @@ fn build(gapp: &adw::Application) {
     // The map's places: small dots, names on a light label.
     let css = gtk::CssProvider::new();
     css.load_from_string(&(
-        ".map-place { min-width: 20px; min-height: 20px; padding: 2px; border: 1.5px solid white; box-shadow: 0 1px 2px alpha(black, 0.4); }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; }          .map-bubble { padding: 10px 12px; box-shadow: 0 2px 8px alpha(black, 0.3); }          .map-bubble-photo { border-radius: 6px; }          .map-bubble-arrow { color: @card_bg_color; margin-top: -6px; font-size: 18px; text-shadow: 0 2px 2px alpha(black, 0.2); } "
+        ".map-place { min-width: 20px; min-height: 20px; padding: 2px; border: 1.5px solid white; box-shadow: 0 1px 2px alpha(black, 0.4); }          .map-name { background: alpha(white, 0.85); color: #222; border-radius: 4px; padding: 0 4px; }          .map-bubble { padding: 10px 12px; box-shadow: 0 2px 8px alpha(black, 0.3); }          .map-bubble-photo { border-radius: 6px; }          .map-bubble-arrow { color: @card_bg_color; margin-top: -6px; font-size: 18px; text-shadow: 0 2px 2px alpha(black, 0.2); }          .map-button { background: @window_bg_color; color: @window_fg_color; box-shadow: 0 1px 3px alpha(black, 0.3); }          .map-button:hover { background: mix(@window_bg_color, @window_fg_color, 0.08); } "
             .to_string()
             + &icons::css()),
     );
@@ -174,6 +175,9 @@ fn build(gapp: &adw::Application) {
     let smap = shumate::SimpleMap::new();
     smap.set_vexpand(true);
     smap.set_hexpand(true);
+    // The zoom buttons light, like the rest of the window, not libshumate's
+    // dark on-screen ones.
+    light_buttons(smap.upcast_ref());
     let viewport = smap.viewport().expect("a viewport");
     let layer = shumate::MarkerLayer::new(&viewport);
     smap.add_overlay_layer(&layer);
@@ -1047,7 +1051,7 @@ fn layers_ui(me: &Rc<App>) {
     libs.sort();
     libs.dedup();
     if maps.is_empty() {
-        let row = adw::ActionRow::builder().title("No map yet").subtitle("Add a library with a map with +").build();
+        let row = adw::ActionRow::builder().title("No map yet").subtitle("Join a map library in Announces, or add one by its link with +").build();
         row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
         me.layers_group.add(&row);
         me.layer_rows.borrow_mut().push(row.upcast());
@@ -1218,8 +1222,18 @@ fn refresh_base(me: &Rc<App>, changed: &HashSet<String>) {
     }
 }
 
-/// Nothing but the land colour: places still show, there's just no map under them.
-const BLANK_STYLE: &str = r##"{"version":8,"sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"#f2efe9"}}]}"##;
+/// The map's on-screen buttons (zoom), in the window's own colours.
+fn light_buttons(w: &gtk::Widget) {
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if c.is::<gtk::Button>() && c.has_css_class("osd") {
+            c.remove_css_class("osd");
+            c.add_css_class("map-button");
+        }
+        light_buttons(&c);
+        child = c.next_sibling();
+    }
+}
 
 /// Draws the map from a tileset in retifs, or a blank one ("").
 fn set_base(me: &Rc<App>, id: &str) {
@@ -1230,7 +1244,7 @@ fn set_base(me: &Rc<App>, id: &str) {
     }
     let t = me.tilesets.borrow().iter().find(|t| t.id == id).cloned();
     let Some(t) = t else {
-        if let Ok(blank) = shumate::VectorRenderer::new("blank", BLANK_STYLE) {
+        if let Some(blank) = blank::renderer() {
             blank.set_max_zoom_level(18);
             set_source(me, &blank);
         }
