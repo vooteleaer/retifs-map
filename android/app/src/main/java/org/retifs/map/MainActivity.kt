@@ -599,7 +599,7 @@ fun Problem(p: Retifs.Problem, letIn: () -> Unit, retry: () -> Unit) {
             }
             Retifs.Problem.NOT_RUNNING -> {
                 Text("retifs isn't running", style = MaterialTheme.typography.titleMedium)
-                Text("Open retifs: it starts once Reticulum (Prns) is up.")
+                Text("Open retifs: it starts once Reticulum is up.")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Retifs.open(context)?.let { i -> OutlinedButton(onClick = { context.startActivity(i) }) { Text("Open retifs") } }
                     Button(onClick = retry) { Text("Try again") }

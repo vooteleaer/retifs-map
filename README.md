@@ -26,7 +26,7 @@ osmium export poi.osm.pbf -f geojsonseq -a type,id | import/osm-places.py > plac
 retifs-map-import places places.jsonl --ns eesti-kohad --index cell,type,find
 ```
 
-Announce the library (`retifs ns announce NS`) and every retifs node that hears it can follow it.
+Announce the library (`retifs library announce NS`) and every retifs node that hears it can follow it.
 
 ## License
 

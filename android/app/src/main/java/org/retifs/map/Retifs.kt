@@ -125,5 +125,6 @@ class MapApp : Application() {
     override fun onCreate() {
         super.onCreate()
         Retifs.start(this)
+        CrashReports.install(this, Core::crashDir, Core::crashReport)
     }
 }

@@ -421,6 +421,13 @@ impl Map {
         Map { rt, store: libretifs::default_store_dir(), via }
     }
 
+    /// A crash or trouble report to retifs (ADR-0036), which keeps it for the
+    /// user's crash library.
+    pub fn crash_report(&self, kind: &str, source: &str, text: &str) -> Result<(), String> {
+        let mut c = self.client()?;
+        self.call(&mut c, Request::CrashReport { kind: kind.into(), source: source.into(), text: text.into() }).map(|_| ())
+    }
+
     /// Saves a new place in `ns`; its record ID.
     pub fn save_place(&self, ns: &str, name: &str, lat: f64, lon: f64, address: &str) -> Result<String, String> {
         let mut c = self.client()?;

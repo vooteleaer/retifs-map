@@ -202,3 +202,32 @@ pub extern "system" fn Java_org_retifs_map_Core_waitChange<'l>(mut env: JNIEnv<'
     let r = unsafe { capi::rm_wait_change(k.as_ptr(), timeout_ms) };
     out(&mut env, r)
 }
+
+/// Where the core's own panics are written (retifs ADR-0036): `dir`, each
+/// report starting with `header`; the app sends them to retifs at its next start.
+#[no_mangle]
+pub extern "system" fn Java_org_retifs_map_Core_crashDir<'l>(mut env: JNIEnv<'l>, _: JClass<'l>, dir: JString<'l>, header: JString<'l>) {
+    let (dir, header) = (text(&mut env, &dir), text(&mut env, &header));
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let report = format!("{header}Panic in the map core, thread '{thread}': {info}\n\n--- backtrace ---\n{}", std::backtrace::Backtrace::force_capture());
+        let part = format!("{dir}/.{ms}-app_panic.txt.part");
+        if std::fs::write(&part, report).is_ok() {
+            let _ = std::fs::rename(&part, format!("{dir}/{ms}-app_panic.txt"));
+        }
+    }));
+}
+
+/// A crash or trouble report to retifs (retifs ADR-0036): whether it took it.
+#[no_mangle]
+pub extern "system" fn Java_org_retifs_map_Core_crashReport<'l>(mut env: JNIEnv<'l>, _: JClass<'l>, kind: JString<'l>, source: JString<'l>, report: JString<'l>) -> jboolean {
+    let (kind, source, report) = (text(&mut env, &kind), text(&mut env, &source), text(&mut env, &report));
+    (retifs_map_core::Map::new().crash_report(&kind, &source, &report).is_ok()) as jboolean
+}
+
+fn text(env: &mut JNIEnv, s: &JString) -> String {
+    env.get_string(s).map(Into::into).unwrap_or_default()
+}
